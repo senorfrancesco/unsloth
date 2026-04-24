@@ -63,6 +63,7 @@ from routes import (
     export_router,
     inference_router,
     models_router,
+    rag_router,
     training_history_router,
     training_router,
 )
@@ -202,6 +203,7 @@ app.include_router(inference_router, prefix = "/v1", tags = ["openai-compat"])
 app.include_router(datasets_router, prefix = "/api/datasets", tags = ["datasets"])
 app.include_router(data_recipe_router, prefix = "/api/data-recipe", tags = ["data-recipe"])
 app.include_router(export_router, prefix = "/api/export", tags = ["export"])
+app.include_router(rag_router, prefix = "/api/rag", tags = ["rag"])
 app.include_router(
     training_history_router, prefix = "/api/train", tags = ["training-history"]
 )
