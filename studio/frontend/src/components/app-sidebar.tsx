@@ -35,6 +35,7 @@ import {
   ChefHatIcon,
   ColumnInsertIcon,
   CursorInfo02Icon,
+  Database02Icon,
   Delete02Icon,
   Download03Icon,
   GemIcon,
@@ -190,6 +191,7 @@ export function AppSidebar() {
   useEffect(() => { if (isStudioRoute) setRunsOpen(true); }, [isStudioRoute]);
 
   const isRecipesRoute = pathname.startsWith("/data-recipes");
+  const isRagAdminRoute = pathname === "/admin/rag" || pathname.startsWith("/admin/rag/");
   const { displayTitle, avatarDataUrl } = useEffectiveProfile();
 
   const { items: chatItems } = useChatSidebarItems();
@@ -368,6 +370,18 @@ export function AppSidebar() {
                 active={isRecipesRoute}
                 onClick={() => {
                   navigate({ to: "/data-recipes" });
+                  closeMobileIfOpen();
+                }}
+              />
+
+              <NavItem
+                icon={Database02Icon}
+                label="RAG Admin"
+                active={isRagAdminRoute}
+                disabled={chatOnly}
+                onClick={() => {
+                  if (chatOnly) return;
+                  navigate({ to: "/admin/rag" });
                   closeMobileIfOpen();
                 }}
               />
