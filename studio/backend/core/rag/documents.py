@@ -3,10 +3,15 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
+import io
 import json
+import mimetypes
+import tarfile
+import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 from uuid import uuid4
 
@@ -16,7 +21,9 @@ from utils.paths import ensure_dir
 
 
 ALLOWED_DOCUMENT_EXTS = {".txt", ".md", ".pdf", ".docx"}
+ARCHIVE_EXTS = {".zip", ".tar", ".tar.gz", ".tgz", ".gz", ".rar"}
 MAX_FILE_SIZE = 50 * 1024 * 1024
+MAX_ARCHIVE_DOCUMENTS = 500
 
 
 @dataclass(frozen = True)
@@ -96,9 +103,15 @@ def write_text_document(
 
 
 async def store_uploaded_document(*, dataset_dir: Path, file: UploadFile) -> dict[str, object]:
-    original_filename = Path(file.filename or "upload").name
-    ext = Path(original_filename).suffix.lower()
-    if ext not in ALLOWED_DOCUMENT_EXTS:
+    documents = await store_uploaded_documents(dataset_dir = dataset_dir, file = file)
+    return documents[0]
+
+
+async def store_uploaded_documents(*, dataset_dir: Path, file: UploadFile) -> list[dict[str, object]]:
+    original_filename = _safe_archive_member_name(file.filename or "upload")
+    ext = _document_ext(original_filename)
+    archive_ext = _archive_ext(original_filename)
+    if ext not in ALLOWED_DOCUMENT_EXTS and archive_ext not in ARCHIVE_EXTS:
         raise HTTPException(
             status_code = 400,
             detail = f"Unsupported file type: {ext}",
@@ -108,6 +121,45 @@ async def store_uploaded_document(*, dataset_dir: Path, file: UploadFile) -> dic
         raise HTTPException(status_code = 400, detail = "Empty file not allowed.")
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code = 413, detail = "File too large.")
+
+    if archive_ext in ARCHIVE_EXTS:
+        documents = _store_archive_documents(
+            dataset_dir = dataset_dir,
+            archive_filename = original_filename,
+            content = content,
+            content_type = file.content_type or "application/octet-stream",
+            archive_ext = archive_ext,
+        )
+        if not documents:
+            raise HTTPException(status_code = 422, detail = "No supported documents found in archive.")
+        return documents
+
+    return [
+        _store_document_content(
+            dataset_dir = dataset_dir,
+            document_name = original_filename,
+            content = content,
+            content_type = file.content_type or mimetypes.guess_type(original_filename)[0] or "application/octet-stream",
+            archive_filename = None,
+            archive_member = None,
+        )
+    ]
+
+
+def _store_document_content(
+    *,
+    dataset_dir: Path,
+    document_name: str,
+    content: bytes,
+    content_type: str,
+    archive_filename: str | None,
+    archive_member: str | None,
+) -> dict[str, object]:
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code = 413, detail = f"File `{document_name}` is too large.")
+    ext = _document_ext(document_name)
+    if ext not in ALLOWED_DOCUMENT_EXTS:
+        raise HTTPException(status_code = 400, detail = f"Unsupported file type: {ext}")
 
     document_id = uuid4().hex
     docs_dir = ensure_dir(dataset_dir / "documents")
@@ -123,9 +175,11 @@ async def store_uploaded_document(*, dataset_dir: Path, file: UploadFile) -> dic
     metadata_path.write_text(
         json.dumps(
             {
-                "original_filename": original_filename,
+                "original_filename": document_name,
                 "size_bytes": len(content),
-                "content_type": file.content_type or "application/octet-stream",
+                "content_type": content_type,
+                "archive_filename": archive_filename,
+                "archive_member": archive_member,
             },
             ensure_ascii = False,
         ),
@@ -133,8 +187,8 @@ async def store_uploaded_document(*, dataset_dir: Path, file: UploadFile) -> dic
     )
     return {
         "id": document_id,
-        "document_name": original_filename,
-        "mime_type": file.content_type or "application/octet-stream",
+        "document_name": document_name,
+        "mime_type": content_type,
         "size_bytes": len(content),
         "text_char_count": len(extracted_text),
         "content_hash": hashlib.sha256(extracted_text.encode("utf-8")).hexdigest(),
@@ -142,6 +196,104 @@ async def store_uploaded_document(*, dataset_dir: Path, file: UploadFile) -> dic
         "extracted_path": str(extracted_path),
         "metadata_path": str(metadata_path),
     }
+
+
+def _store_archive_documents(
+    *,
+    dataset_dir: Path,
+    archive_filename: str,
+    content: bytes,
+    content_type: str,
+    archive_ext: str,
+) -> list[dict[str, object]]:
+    documents: list[dict[str, object]] = []
+    for member_name, member_content in _iter_archive_members(
+        archive_filename = archive_filename,
+        content = content,
+        archive_ext = archive_ext,
+    ):
+        if len(documents) >= MAX_ARCHIVE_DOCUMENTS:
+            raise HTTPException(status_code = 413, detail = "Archive contains too many documents.")
+        safe_name = _safe_archive_member_name(member_name)
+        if _document_ext(safe_name) not in ALLOWED_DOCUMENT_EXTS:
+            continue
+        documents.append(
+            _store_document_content(
+                dataset_dir = dataset_dir,
+                document_name = safe_name,
+                content = member_content,
+                content_type = mimetypes.guess_type(safe_name)[0] or content_type,
+                archive_filename = archive_filename,
+                archive_member = member_name,
+            )
+        )
+    return documents
+
+
+def _iter_archive_members(
+    *,
+    archive_filename: str,
+    content: bytes,
+    archive_ext: str,
+) -> Iterable[tuple[str, bytes]]:
+    if archive_ext == ".zip":
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            for item in archive.infolist():
+                if item.is_dir():
+                    continue
+                yield item.filename, archive.read(item)
+        return
+    if archive_ext in {".tar", ".tar.gz", ".tgz"}:
+        with tarfile.open(fileobj = io.BytesIO(content), mode = "r:*") as archive:
+            for item in archive.getmembers():
+                if not item.isfile():
+                    continue
+                handle = archive.extractfile(item)
+                if handle is None:
+                    continue
+                yield item.name, handle.read()
+        return
+    if archive_ext == ".gz":
+        inner_name = archive_filename.removesuffix(".gz")
+        if _document_ext(inner_name) not in ALLOWED_DOCUMENT_EXTS:
+            inner_name = f"{Path(inner_name).name or 'document'}.txt"
+        yield inner_name, gzip.decompress(content)
+        return
+    if archive_ext == ".rar":
+        try:
+            import rarfile
+        except ImportError as exc:  # pragma: no cover - depends on runtime
+            raise RuntimeError("RAR extraction dependency `rarfile` is missing.") from exc
+        with rarfile.RarFile(io.BytesIO(content)) as archive:  # pragma: no cover - depends on runtime
+            for item in archive.infolist():
+                if item.isdir():
+                    continue
+                yield item.filename, archive.read(item)
+        return
+    raise RuntimeError(f"Unsupported archive type: {archive_ext}")
+
+
+def _safe_archive_member_name(value: str) -> str:
+    path = PurePosixPath(value.replace("\\", "/"))
+    parts = [
+        part
+        for part in path.parts
+        if part not in {"", ".", ".."} and not part.startswith("/")
+    ]
+    return "/".join(parts) or Path(value).name or "document.txt"
+
+
+def _document_ext(filename: str) -> str:
+    return Path(filename).suffix.lower()
+
+
+def _archive_ext(filename: str) -> str:
+    value = filename.lower()
+    if value.endswith(".tar.gz"):
+        return ".tar.gz"
+    if value.endswith(".tgz"):
+        return ".tgz"
+    return Path(value).suffix.lower()
 
 
 def build_qdrant_points(
@@ -156,6 +308,7 @@ def build_qdrant_points(
     chunk_recipe: str,
     embedding_config: dict[str, object],
     vectors: list[list[float]],
+    indexed_at: str | None = None,
 ) -> tuple[list[dict[str, object]], int]:
     points: list[dict[str, object]] = []
     vector_cursor = 0
@@ -205,6 +358,7 @@ def build_qdrant_points(
                         "source_hash": document["content_hash"],
                         "hash": document["content_hash"],
                         "projection_id": projection_id,
+                        "indexed_at": indexed_at,
                     },
                 }
             )

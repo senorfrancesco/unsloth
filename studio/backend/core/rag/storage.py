@@ -428,6 +428,18 @@ class SQLiteRAGRepository:
         finally:
             conn.close()
 
+    def delete_module_instance(self, instance_id: str) -> bool:
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM rag_module_instances WHERE id = ?",
+                (instance_id,),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
     def list_datasets(self) -> list[dict[str, Any]]:
         conn = self._connect()
         try:

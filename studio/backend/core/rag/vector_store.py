@@ -11,6 +11,24 @@ import httpx
 class VectorStoreAdapterProtocol(Protocol):
     def health_check(self) -> dict[str, object]: ...
 
+    def get_collection_info(self, *, collection_name: str) -> dict[str, object]: ...
+
+    def scroll_points(
+        self,
+        *,
+        collection_name: str,
+        limit: int,
+        offset: object | None = None,
+    ) -> dict[str, object]: ...
+
+    def search_points(
+        self,
+        *,
+        collection_name: str,
+        vector: list[float],
+        limit: int,
+    ) -> dict[str, object]: ...
+
     def ensure_collection(self, *, collection_name: str, vector_size: int) -> None: ...
 
     def upsert_chunks(
@@ -73,6 +91,70 @@ class QdrantVectorStoreAdapter:
         )
         create_response.raise_for_status()
 
+    def get_collection_info(self, *, collection_name: str) -> dict[str, object]:
+        response = httpx.get(
+            f"{self._base_url}/collections/{collection_name}",
+            headers = self._headers,
+            timeout = self._timeout,
+        )
+        if response.status_code == 404:
+            return {
+                "status": "missing",
+                "details": {"collection_name": collection_name, "base_url": self._base_url},
+            }
+        response.raise_for_status()
+        payload = response.json()
+        return {
+            "status": "found",
+            "details": payload.get("result", {}),
+        }
+
+    def scroll_points(
+        self,
+        *,
+        collection_name: str,
+        limit: int,
+        offset: object | None = None,
+    ) -> dict[str, object]:
+        if isinstance(offset, int) and offset > 0:
+            return self._scroll_points_by_index(
+                collection_name = collection_name,
+                limit = limit,
+                offset = offset,
+            )
+        return self._scroll_points_raw(
+            collection_name = collection_name,
+            limit = limit,
+            offset = offset,
+        )
+
+    def search_points(
+        self,
+        *,
+        collection_name: str,
+        vector: list[float],
+        limit: int,
+    ) -> dict[str, object]:
+        response = httpx.post(
+            f"{self._base_url}/collections/{collection_name}/points/search",
+            headers = self._headers,
+            json = {
+                "vector": vector,
+                "limit": max(1, min(limit, 100)),
+                "with_payload": True,
+                "with_vector": False,
+            },
+            timeout = self._timeout,
+        )
+        if response.status_code == 404:
+            return {"points": [], "status": "missing"}
+        response.raise_for_status()
+        payload = response.json()
+        return {
+            "points": payload.get("result", []),
+            "status": "ok",
+        }
+
     def upsert_chunks(
         self,
         *,
@@ -105,6 +187,66 @@ class QdrantVectorStoreAdapter:
             timeout = self._timeout,
         )
         response.raise_for_status()
+
+    def _scroll_points_raw(
+        self,
+        *,
+        collection_name: str,
+        limit: int,
+        offset: object | None,
+    ) -> dict[str, object]:
+        body: dict[str, object] = {
+            "limit": max(1, min(limit, 1000)),
+            "with_payload": True,
+            "with_vector": False,
+        }
+        if offset is not None and offset != 0:
+            body["offset"] = offset
+        response = httpx.post(
+            f"{self._base_url}/collections/{collection_name}/points/scroll",
+            headers = self._headers,
+            json = body,
+            timeout = self._timeout,
+        )
+        if response.status_code == 404:
+            return {"points": [], "next_page_offset": None, "status": "missing"}
+        response.raise_for_status()
+        payload = response.json()
+        result = payload.get("result", {})
+        return {
+            "points": result.get("points", []),
+            "next_page_offset": result.get("next_page_offset"),
+            "status": "ok",
+        }
+
+    def _scroll_points_by_index(
+        self,
+        *,
+        collection_name: str,
+        limit: int,
+        offset: int,
+    ) -> dict[str, object]:
+        target_count = offset + max(1, min(limit, 1000))
+        points: list[object] = []
+        cursor: object | None = None
+        while len(points) < target_count:
+            response = self._scroll_points_raw(
+                collection_name = collection_name,
+                limit = min(256, target_count - len(points)),
+                offset = cursor,
+            )
+            batch = list(response.get("points", []))
+            points.extend(batch)
+            cursor = response.get("next_page_offset")
+            if not batch or cursor is None:
+                break
+        page = points[offset:target_count]
+        next_offset = offset + len(page) if len(points) > target_count or cursor is not None else None
+        return {
+            "points": page,
+            "next_page_offset": next_offset,
+            "status": "ok",
+        }
 
 
 def build_vector_store_adapter(connection_profile: dict[str, Any]) -> VectorStoreAdapterProtocol:

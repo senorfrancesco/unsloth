@@ -149,3 +149,6 @@ def test_repository_persists_rag_module_records(tmp_path: Path):
     assert repository.get_module_instance("ragmod_local") == instance
     assert repository.list_module_installations() == [installation]
     assert repository.list_module_instances() == [instance]
+    assert repository.delete_module_instance("ragmod_local") is True
+    assert repository.delete_module_instance("ragmod_local") is False
+    assert repository.get_module_instance("ragmod_local") is None

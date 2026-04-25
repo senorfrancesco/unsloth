@@ -191,6 +191,23 @@ def install_local_catalog_module(
     return check_catalog_module(item)
 
 
+def uninstall_catalog_module(item: RAGModuleCatalogItem) -> RAGModuleInstallationSummary:
+    if not item.package_name:
+        return RAGModuleInstallationSummary(
+            module_id = item.id,
+            kind = item.kind,
+            source_type = item.source_type,
+            status = "error",
+            last_checked_at = module_now_iso(),
+            last_error = "This module does not declare a Python package to uninstall.",
+        )
+
+    result = _run_pip([sys.executable, "-m", "pip", "uninstall", "-y", item.package_name])
+    if result["returncode"] != 0:
+        return _install_error(item, str(result["stderr"] or result["stdout"] or "pip uninstall failed."))
+    return check_catalog_module(item)
+
+
 def _distribution_version(package_name: str) -> str | None:
     try:
         return importlib.metadata.version(package_name)

@@ -6,7 +6,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Callable
+from typing import Any, Callable
 from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile
@@ -15,7 +15,7 @@ from core.rag.documents import (
     build_qdrant_points,
     chunk_text,
     read_extracted_text,
-    store_uploaded_document,
+    store_uploaded_documents,
     write_text_document,
 )
 from core.rag.embedding import (
@@ -27,6 +27,7 @@ from core.rag.modules import (
     check_module_instance,
     install_catalog_module,
     install_local_catalog_module,
+    uninstall_catalog_module,
 )
 from core.rag.registry import get_rag_module_by_id, get_rag_module_catalog, get_rag_providers
 from core.rag.storage import SQLiteRAGRepository, create_rag_repository_from_env
@@ -44,6 +45,15 @@ from models.rag import (
     InstallRAGModuleRequest,
     PublishRAGDatasetRequest,
     RAGCollectionListResponse,
+    RAGCollectionChunkPayload,
+    RAGCollectionChunkStats,
+    RAGCollectionDistributionItem,
+    RAGCollectionInspectDistributions,
+    RAGCollectionInspectResponse,
+    RAGCollectionInspectVectorState,
+    RAGCollectionSampleChunksResponse,
+    RAGCollectionSearchResponse,
+    RAGCollectionSearchResult,
     RAGCollectionSummary,
     RAGConnectionDiagnostic,
     RAGConnectionProfileListResponse,
@@ -53,6 +63,7 @@ from models.rag import (
     RAGDatasetListResponse,
     RAGDatasetSummary,
     RAGDiagnosticsResponse,
+    RAGDocumentUploadItem,
     RAGDocumentUploadResponse,
     RAGIndexProjectionSummary,
     RAGIngestionProfileListResponse,
@@ -69,6 +80,7 @@ from models.rag import (
     RAGOverviewBackend,
     RAGOverviewResponse,
     RAGProvidersResponse,
+    SearchRAGCollectionRequest,
 )
 from utils.paths import datasets_root, ensure_dir
 
@@ -165,6 +177,28 @@ class RAGService:
             message = "Local module install completed.",
         )
 
+    def uninstall_module_package(self, module_id: str) -> RAGModuleActionResponse:
+        catalog_item = self._require_module(module_id)
+        if not catalog_item.package_name:
+            raise HTTPException(
+                status_code = 400,
+                detail = "This module does not declare a Python package to uninstall.",
+            )
+        summary = uninstall_catalog_module(catalog_item)
+        affected_modules: list[dict[str, Any]] = []
+        for item in get_rag_module_catalog().items:
+            if item.package_name != catalog_item.package_name:
+                continue
+            affected_summary = check_catalog_module(item)
+            self._repository.upsert_module_installation(affected_summary.model_dump())
+            affected_modules.append(affected_summary.model_dump())
+        response = self._module_action_response(
+            summary,
+            message = "Managed module uninstall completed.",
+        )
+        response.details["affected_modules"] = affected_modules
+        return response
+
     def list_module_instances(self) -> RAGModuleInstanceListResponse:
         items = [
             RAGModuleInstanceSummary.model_validate(item)
@@ -208,6 +242,23 @@ class RAGService:
             status = summary.status,
             message = "Module instance test completed.",
             details = summary.model_dump(),
+        )
+
+    def delete_module_instance(self, instance_id: str) -> RAGModuleActionResponse:
+        record = self._require_module_instance(instance_id)
+        cleared_profiles = self._clear_module_instance_references(instance_id)
+        deleted = self._repository.delete_module_instance(instance_id)
+        if not deleted:
+            raise HTTPException(status_code = 404, detail = "RAG module instance not found.")
+        return RAGModuleActionResponse(
+            module_id = str(record["module_id"]),
+            status = "configured",
+            message = "Module instance record deleted.",
+            details = {
+                "instance_id": instance_id,
+                "deleted_files": False,
+                "cleared_ingestion_profile_ids": cleared_profiles,
+            },
         )
 
     def get_overview(self) -> RAGOverviewResponse:
@@ -353,6 +404,11 @@ class RAGService:
                 "extracted_path": stored["extracted_path"],
                 "metadata_path": stored["metadata_path"],
                 "created_at": _now_iso(),
+                "processing_status": "ready",
+                "processing_error": None,
+                "processed_at": _now_iso(),
+                "extractor": "manual-text",
+                "ocr_engine": "none",
             }
             self._repository.insert_dataset_document(document)
             self._refresh_dataset_stats(dataset_id)
@@ -364,28 +420,56 @@ class RAGService:
         with self._lock:
             dataset = self._require_dataset(dataset_id)
             dataset_dir = self._dataset_dir(dataset_id)
-            stored = await store_uploaded_document(dataset_dir = dataset_dir, file = file)
-            document = {
-                "id": stored["id"],
-                "dataset_id": dataset_id,
-                "document_name": stored["document_name"],
-                "mime_type": stored["mime_type"],
-                "source_kind": dataset["source_kind"],
-                "size_bytes": stored["size_bytes"],
-                "text_char_count": stored["text_char_count"],
-                "content_hash": stored["content_hash"],
-                "raw_path": stored["raw_path"],
-                "extracted_path": stored["extracted_path"],
-                "metadata_path": stored["metadata_path"],
-                "created_at": _now_iso(),
-            }
-            self._repository.insert_dataset_document(document)
+            self._mark_dataset_processing(dataset_id)
+            try:
+                stored_documents = await store_uploaded_documents(dataset_dir = dataset_dir, file = file)
+            except HTTPException as exc:
+                self._mark_dataset_error(dataset_id, detail = exc.detail)
+                raise
+            except Exception as exc:
+                self._mark_dataset_error(dataset_id, detail = str(exc))
+                raise HTTPException(status_code = 422, detail = str(exc)) from exc
+            processed_at = _now_iso()
+            documents: list[dict[str, object]] = []
+            for stored in stored_documents:
+                document = {
+                    "id": stored["id"],
+                    "dataset_id": dataset_id,
+                    "document_name": stored["document_name"],
+                    "mime_type": stored["mime_type"],
+                    "source_kind": dataset["source_kind"],
+                    "size_bytes": stored["size_bytes"],
+                    "text_char_count": stored["text_char_count"],
+                    "content_hash": stored["content_hash"],
+                    "raw_path": stored["raw_path"],
+                    "extracted_path": stored["extracted_path"],
+                    "metadata_path": stored["metadata_path"],
+                    "created_at": processed_at,
+                    "processing_status": "ready",
+                    "processing_error": None,
+                    "processed_at": processed_at,
+                    "extractor": "builtin-file",
+                    "ocr_engine": "none",
+                }
+                self._repository.insert_dataset_document(document)
+                documents.append(document)
             self._refresh_dataset_stats(dataset_id)
+            first_document = documents[0]
+            uploaded_items = [
+                RAGDocumentUploadItem(
+                    file_id = str(document["id"]),
+                    filename = str(document["document_name"]),
+                    size_bytes = int(document["size_bytes"]),
+                    status = "ok",
+                )
+                for document in documents
+            ]
             return RAGDocumentUploadResponse(
-                file_id = str(document["id"]),
-                filename = str(document["document_name"]),
-                size_bytes = int(document["size_bytes"]),
+                file_id = str(first_document["id"]),
+                filename = str(first_document["document_name"]),
+                size_bytes = sum(int(document["size_bytes"]) for document in documents),
                 status = "ok",
+                files = uploaded_items,
             )
 
     def list_collections(self) -> RAGCollectionListResponse:
@@ -463,6 +547,7 @@ class RAGService:
                     collection_name = str(projection["physical_collection_name"]),
                     vector_size = len(vectors[0]),
                 )
+                indexed_at = _now_iso()
                 points, total_chunks = build_qdrant_points(
                     collection_id = collection_id,
                     projection_id = str(projection["id"]),
@@ -474,6 +559,7 @@ class RAGService:
                     chunk_recipe = str(projection["chunk_recipe"]),
                     embedding_config = self._embedding_config(components["embedding_model"]),
                     vectors = vectors,
+                    indexed_at = indexed_at,
                 )
                 adapter.upsert_chunks(
                     collection_name = str(projection["physical_collection_name"]),
@@ -486,7 +572,7 @@ class RAGService:
 
                 collection = self._require_collection(collection_id)
                 projection["status"] = "ready"
-                projection["indexed_at"] = _now_iso()
+                projection["indexed_at"] = indexed_at
                 projection["source_document_count"] = int(collection["documents_count"])
                 self._repository.upsert_projection(projection)
                 collection["last_job_status"] = "completed"
@@ -535,6 +621,7 @@ class RAGService:
 
                 adapter = self._vector_store_factory(connection)
                 current_projection = self._require_projection(collection["active_projection_id"])
+                indexed_at = _now_iso()
                 next_projection = self._build_projection(
                     collection_id = collection_id,
                     remote_collection_name = str(collection["remote_collection_name"]),
@@ -547,7 +634,7 @@ class RAGService:
                     chunk_overlap = int(ingestion["chunk_overlap"]),
                     version = int(current_projection["version"]) + 1,
                     status = "ready",
-                    indexed_at = _now_iso(),
+                    indexed_at = indexed_at,
                     source_document_count = len(documents),
                 )
                 points, total_chunks = build_qdrant_points(
@@ -561,6 +648,7 @@ class RAGService:
                     chunk_recipe = str(next_projection["chunk_recipe"]),
                     embedding_config = self._embedding_config(components["embedding_model"]),
                     vectors = vectors,
+                    indexed_at = indexed_at,
                 )
                 adapter.ensure_collection(
                     collection_name = str(next_projection["physical_collection_name"]),
@@ -609,6 +697,161 @@ class RAGService:
             )
             return RAGJobSummary.model_validate(job)
 
+    def inspect_collection(self, collection_id: str) -> RAGCollectionInspectResponse:
+        collection, connection, ingestion, projection, adapter = self._qdrant_inspection_context(collection_id)
+        warnings: list[str] = []
+        physical_collection_name = str(projection["physical_collection_name"])
+
+        health = self._safe_vector_store_health(adapter)
+        qdrant_status = str(health.get("status", "unknown"))
+        qdrant_details = dict(health.get("details", {}))
+        collection_info: dict[str, Any] = {}
+        points: list[dict[str, Any]] = []
+        truncated = False
+
+        if qdrant_status == "healthy":
+            info = self._safe_collection_info(adapter, physical_collection_name)
+            info_status = str(info.get("status", "unknown"))
+            collection_info = dict(info.get("details", {}))
+            if info_status == "missing":
+                qdrant_status = "missing"
+                warnings.append(
+                    f"Physical Qdrant collection `{physical_collection_name}` was not found."
+                )
+            elif info_status == "error":
+                qdrant_status = "error"
+                warnings.append(str(info.get("message", "Failed to read Qdrant collection info.")))
+            else:
+                points, truncated = self._scroll_collection_points_for_inspect(
+                    adapter,
+                    collection_name = physical_collection_name,
+                    limit = 5000,
+                    warnings = warnings,
+                )
+        else:
+            warnings.append(
+                "Qdrant connection is not healthy; collection payload could not be inspected."
+            )
+
+        if collection.get("last_error"):
+            warnings.append(str(collection["last_error"]))
+
+        chunks = [self._chunk_payload_from_point(point, projection = projection) for point in points]
+        qdrant_points_total = self._extract_qdrant_points_total(collection_info)
+        stats = self._build_chunk_stats(
+            chunks,
+            points = points,
+            projection = projection,
+            qdrant_points_total = qdrant_points_total,
+            inspected_limit = 5000,
+            truncated = truncated,
+        )
+        if (
+            not truncated
+            and qdrant_status == "healthy"
+            and int(collection.get("chunks_count", 0)) != stats.chunks_total
+        ):
+            warnings.append(
+                "Stored collection chunk count does not match the active Qdrant projection."
+            )
+
+        return RAGCollectionInspectResponse(
+            collection = self._to_collection_summary(collection),
+            connection_profile = self._to_connection_summary(connection),
+            ingestion_profile = RAGIngestionProfileSummary.model_validate(ingestion),
+            active_projection = RAGIndexProjectionSummary.model_validate(projection),
+            qdrant = RAGCollectionInspectVectorState(
+                backend = "qdrant",
+                status = qdrant_status,
+                physical_collection_name = physical_collection_name,
+                details = qdrant_details,
+                collection_info = collection_info,
+            ),
+            stats = stats,
+            distributions = self._build_chunk_distributions(chunks),
+            warnings = warnings,
+        )
+
+    def sample_collection_chunks(
+        self,
+        collection_id: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> RAGCollectionSampleChunksResponse:
+        _collection, _connection, _ingestion, projection, adapter = self._qdrant_inspection_context(collection_id)
+        physical_collection_name = str(projection["physical_collection_name"])
+        response = self._call_vector_store(
+            lambda: adapter.scroll_points(
+                collection_name = physical_collection_name,
+                limit = limit,
+                offset = offset,
+            ),
+            action_label = "read Qdrant collection chunks",
+        )
+        points = [dict(point) for point in response.get("points", []) if isinstance(point, dict)]
+        next_page_offset = response.get("next_page_offset")
+        next_offset = int(next_page_offset) if isinstance(next_page_offset, int) else None
+        return RAGCollectionSampleChunksResponse(
+            collection_id = collection_id,
+            limit = limit,
+            offset = offset,
+            next_offset = next_offset,
+            items = [
+                self._chunk_payload_from_point(point, projection = projection)
+                for point in points
+            ],
+        )
+
+    def search_collection(
+        self,
+        collection_id: str,
+        payload: SearchRAGCollectionRequest,
+    ) -> RAGCollectionSearchResponse:
+        _collection, _connection, _ingestion, projection, adapter = self._qdrant_inspection_context(collection_id)
+        query = payload.query.strip()
+        if not query:
+            raise HTTPException(status_code = 400, detail = "Search query cannot be empty.")
+
+        embedding_model = str(projection["embedding_model"])
+        try:
+            query_vectors = self._embedding_provider.embed_texts(embedding_model, [query])
+        except Exception as exc:
+            raise HTTPException(
+                status_code = 500,
+                detail = f"Failed to build query embedding: {exc}",
+            ) from exc
+        if not query_vectors:
+            raise HTTPException(status_code = 400, detail = "Search query produced no embedding.")
+
+        physical_collection_name = str(projection["physical_collection_name"])
+        response = self._call_vector_store(
+            lambda: adapter.search_points(
+                collection_name = physical_collection_name,
+                vector = query_vectors[0],
+                limit = payload.limit,
+            ),
+            action_label = "search Qdrant collection",
+        )
+        raw_points = [dict(point) for point in response.get("points", []) if isinstance(point, dict)]
+        results: list[RAGCollectionSearchResult] = []
+        for point in raw_points:
+            chunk = self._chunk_payload_from_point(point, projection = projection)
+            results.append(
+                RAGCollectionSearchResult(
+                    **chunk.model_dump(),
+                    score = float(point.get("score", 0.0)),
+                )
+            )
+
+        return RAGCollectionSearchResponse(
+            collection_id = collection_id,
+            query = query,
+            limit = payload.limit,
+            embedding_model = embedding_model,
+            results = results,
+        )
+
     def list_jobs(self) -> RAGJobListResponse:
         items = [RAGJobSummary.model_validate(item) for item in self._repository.list_jobs()]
         items.sort(key = lambda item: item.created_at, reverse = True)
@@ -643,6 +886,268 @@ class RAGService:
             collections = self.list_collections().items,
         )
 
+    def _qdrant_inspection_context(
+        self,
+        collection_id: str,
+    ) -> tuple[dict, dict, dict, dict, VectorStoreAdapterProtocol]:
+        collection = self._require_collection(collection_id)
+        connection = self._require_connection_profile(collection["connection_profile_id"])
+        ingestion = self._require_ingestion_profile(collection["ingestion_profile_id"])
+        projection = self._require_projection(collection["active_projection_id"])
+        backend_ids = {
+            str(collection.get("backend")),
+            str(connection.get("backend")),
+            str(projection.get("backend")),
+        }
+        if backend_ids != {"qdrant"}:
+            raise HTTPException(
+                status_code = 400,
+                detail = "RAG collection inspector currently supports Qdrant collections only.",
+            )
+        try:
+            adapter = self._vector_store_factory(connection)
+        except Exception as exc:
+            raise HTTPException(
+                status_code = 400,
+                detail = f"Failed to initialize Qdrant adapter: {exc}",
+            ) from exc
+        return collection, connection, ingestion, projection, adapter
+
+    def _safe_vector_store_health(self, adapter: VectorStoreAdapterProtocol) -> dict[str, Any]:
+        try:
+            return dict(adapter.health_check())
+        except Exception as exc:
+            return {"status": "error", "details": {"message": str(exc)}}
+
+    def _safe_collection_info(
+        self,
+        adapter: VectorStoreAdapterProtocol,
+        collection_name: str,
+    ) -> dict[str, Any]:
+        try:
+            return dict(adapter.get_collection_info(collection_name = collection_name))
+        except Exception as exc:
+            return {"status": "error", "message": str(exc), "details": {}}
+
+    def _scroll_collection_points_for_inspect(
+        self,
+        adapter: VectorStoreAdapterProtocol,
+        *,
+        collection_name: str,
+        limit: int,
+        warnings: list[str],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        points: list[dict[str, Any]] = []
+        cursor: object | None = None
+        while len(points) < limit:
+            page_size = min(256, limit - len(points))
+            try:
+                response = adapter.scroll_points(
+                    collection_name = collection_name,
+                    limit = page_size,
+                    offset = cursor,
+                )
+            except Exception as exc:
+                warnings.append(f"Failed to scroll Qdrant collection payload: {exc}")
+                break
+            batch = [
+                dict(point)
+                for point in response.get("points", [])
+                if isinstance(point, dict)
+            ]
+            points.extend(batch)
+            cursor = response.get("next_page_offset")
+            if not batch or cursor is None:
+                break
+        return points, cursor is not None
+
+    def _call_vector_store(
+        self,
+        action: Callable[[], dict[str, object]],
+        *,
+        action_label: str,
+    ) -> dict[str, object]:
+        try:
+            return action()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code = 503,
+                detail = f"Failed to {action_label}: {exc}",
+            ) from exc
+
+    def _chunk_payload_from_point(
+        self,
+        point: dict[str, Any],
+        *,
+        projection: dict,
+    ) -> RAGCollectionChunkPayload:
+        payload = point.get("payload") if isinstance(point.get("payload"), dict) else {}
+        payload = dict(payload)
+        indexed_at = payload.get("indexed_at") or projection.get("indexed_at")
+        payload_for_ui = dict(payload)
+        if indexed_at and not payload_for_ui.get("indexed_at"):
+            payload_for_ui["indexed_at"] = indexed_at
+        embedding_config = payload.get("embedding_config")
+        return RAGCollectionChunkPayload(
+            point_id = str(point.get("id") or ""),
+            text = str(payload.get("text") or ""),
+            file_id = self._optional_str(payload.get("file_id") or payload.get("knowledge_file_id")),
+            document_id = self._optional_str(payload.get("document_id")),
+            source = self._optional_str(
+                payload.get("source") or payload.get("document_name") or payload.get("name")
+            ),
+            hash = self._optional_str(payload.get("hash") or payload.get("source_hash")),
+            extractor = self._optional_str(payload.get("extractor") or projection.get("extractor")),
+            ocr_engine = self._optional_str(payload.get("ocr_engine") or projection.get("ocr_engine")),
+            embedding_config = embedding_config if isinstance(embedding_config, dict) else {},
+            chunk_recipe = self._optional_str(payload.get("chunk_recipe") or projection.get("chunk_recipe")),
+            indexed_at = self._optional_str(indexed_at),
+            chunk_index = self._optional_int(payload.get("chunk_index")),
+            payload = payload_for_ui,
+        )
+
+    def _build_chunk_stats(
+        self,
+        chunks: list[RAGCollectionChunkPayload],
+        *,
+        points: list[dict[str, Any]],
+        projection: dict,
+        qdrant_points_total: int | None,
+        inspected_limit: int,
+        truncated: bool,
+    ) -> RAGCollectionChunkStats:
+        text_lengths = [len(chunk.text) for chunk in chunks if chunk.text]
+        document_ids = {
+            chunk.document_id or chunk.file_id
+            for chunk in chunks
+            if chunk.document_id or chunk.file_id
+        }
+        missing_indexed_at_count = 0
+        for point in points:
+            payload = point.get("payload") if isinstance(point.get("payload"), dict) else {}
+            if not payload.get("indexed_at") and not projection.get("indexed_at"):
+                missing_indexed_at_count += 1
+        return RAGCollectionChunkStats(
+            chunks_total = len(chunks),
+            qdrant_points_total = qdrant_points_total,
+            documents_total = len(document_ids),
+            average_chunk_chars = round(sum(text_lengths) / len(text_lengths), 1) if text_lengths else 0.0,
+            min_chunk_chars = min(text_lengths) if text_lengths else 0,
+            max_chunk_chars = max(text_lengths) if text_lengths else 0,
+            missing_text_count = sum(1 for chunk in chunks if not chunk.text),
+            missing_indexed_at_count = missing_indexed_at_count,
+            inspected_limit = inspected_limit,
+            truncated = truncated,
+        )
+
+    def _build_chunk_distributions(
+        self,
+        chunks: list[RAGCollectionChunkPayload],
+    ) -> RAGCollectionInspectDistributions:
+        document_counts: dict[str, dict[str, object]] = {}
+        for chunk in chunks:
+            document_id = chunk.document_id or chunk.file_id or "unknown"
+            label = chunk.source or document_id
+            current = document_counts.setdefault(
+                document_id,
+                {"label": label, "count": 0},
+            )
+            current["count"] = int(current["count"]) + 1
+
+        bucket_counts = {
+            "missing": 0,
+            "0-199": 0,
+            "200-399": 0,
+            "400-799": 0,
+            "800-1199": 0,
+            "1200+": 0,
+        }
+        for chunk in chunks:
+            length = len(chunk.text)
+            if length == 0:
+                bucket_counts["missing"] += 1
+            elif length < 200:
+                bucket_counts["0-199"] += 1
+            elif length < 400:
+                bucket_counts["200-399"] += 1
+            elif length < 800:
+                bucket_counts["400-799"] += 1
+            elif length < 1200:
+                bucket_counts["800-1199"] += 1
+            else:
+                bucket_counts["1200+"] += 1
+
+        status_counts = {"indexed": 0, "missing indexed_at": 0}
+        for chunk in chunks:
+            if chunk.indexed_at:
+                status_counts["indexed"] += 1
+            else:
+                status_counts["missing indexed_at"] += 1
+
+        documents = [
+            RAGCollectionDistributionItem(
+                id = document_id,
+                label = str(payload["label"]),
+                count = int(payload["count"]),
+                value = int(payload["count"]),
+            )
+            for document_id, payload in sorted(
+                document_counts.items(),
+                key = lambda item: (-int(item[1]["count"]), str(item[1]["label"])),
+            )[:20]
+        ]
+        chunk_sizes = [
+            RAGCollectionDistributionItem(
+                id = bucket,
+                label = bucket,
+                count = count,
+                value = count,
+            )
+            for bucket, count in bucket_counts.items()
+            if count > 0
+        ]
+        indexing_statuses = [
+            RAGCollectionDistributionItem(
+                id = status,
+                label = status,
+                count = count,
+                value = count,
+            )
+            for status, count in status_counts.items()
+            if count > 0
+        ]
+        return RAGCollectionInspectDistributions(
+            documents = documents,
+            chunk_sizes = chunk_sizes,
+            indexing_statuses = indexing_statuses,
+        )
+
+    def _extract_qdrant_points_total(self, collection_info: dict[str, Any]) -> int | None:
+        for key in ("points_count", "vectors_count", "indexed_vectors_count"):
+            value = collection_info.get(key)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+        return None
+
+    @staticmethod
+    def _optional_str(value: object) -> str | None:
+        if value is None:
+            return None
+        return str(value)
+
+    @staticmethod
+    def _optional_int(value: object) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     def _to_connection_summary(self, record: dict) -> RAGConnectionProfileSummary:
         payload = dict(record)
         payload.pop("api_key", None)
@@ -674,6 +1179,20 @@ class RAGService:
                 )
             )
         return [chunk.text for chunk in chunk_texts]
+
+    def _mark_dataset_processing(self, dataset_id: str) -> None:
+        dataset = self._require_dataset(dataset_id)
+        dataset["status"] = "processing"
+        dataset["last_error"] = None
+        dataset["updated_at"] = _now_iso()
+        self._repository.upsert_dataset(dataset)
+
+    def _mark_dataset_error(self, dataset_id: str, *, detail: object) -> None:
+        dataset = self._require_dataset(dataset_id)
+        dataset["status"] = "error"
+        dataset["last_error"] = str(detail)
+        dataset["updated_at"] = _now_iso()
+        self._repository.upsert_dataset(dataset)
 
     def _refresh_dataset_stats(self, dataset_id: str, chunk_count: int | None = None) -> None:
         dataset = self._require_dataset(dataset_id)
@@ -830,6 +1349,25 @@ class RAGService:
                 status_code = 400,
                 detail = f"Module instance `{instance_id}` is not a `{expected_kind}` module.",
             )
+
+    def _clear_module_instance_references(self, instance_id: str) -> list[str]:
+        instance_fields = (
+            "extractor_instance_id",
+            "ocr_instance_id",
+            "embedder_instance_id",
+            "reranker_instance_id",
+        )
+        cleared_profile_ids: list[str] = []
+        for profile in self._repository.list_ingestion_profiles():
+            changed = False
+            for field in instance_fields:
+                if profile.get(field) == instance_id:
+                    profile[field] = None
+                    changed = True
+            if changed:
+                self._repository.upsert_ingestion_profile(profile)
+                cleared_profile_ids.append(str(profile["id"]))
+        return cleared_profile_ids
 
     def _require_module(self, module_id: str) -> RAGModuleCatalogItem:
         record = get_rag_module_by_id(module_id)

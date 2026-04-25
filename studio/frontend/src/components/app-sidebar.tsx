@@ -376,7 +376,7 @@ export function AppSidebar() {
 
               <NavItem
                 icon={Database02Icon}
-                label="RAG Admin"
+                label="RAG"
                 active={isRagAdminRoute}
                 disabled={chatOnly}
                 onClick={() => {

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, UploadFile, status
+from fastapi import APIRouter, Query, UploadFile, status
 
 from core.rag.service import get_rag_service
 from models.rag import (
@@ -15,7 +15,10 @@ from models.rag import (
     CreateRAGModuleInstanceRequest,
     InstallRAGModuleRequest,
     PublishRAGDatasetRequest,
+    RAGCollectionInspectResponse,
     RAGCollectionListResponse,
+    RAGCollectionSampleChunksResponse,
+    RAGCollectionSearchResponse,
     RAGCollectionSummary,
     RAGConnectionProfileListResponse,
     RAGConnectionProfileSummary,
@@ -23,6 +26,7 @@ from models.rag import (
     RAGDatasetListResponse,
     RAGDatasetSummary,
     RAGDiagnosticsResponse,
+    RAGDocumentUploadItem,
     RAGDocumentUploadResponse,
     RAGIngestionProfileListResponse,
     RAGIngestionProfileSummary,
@@ -35,6 +39,7 @@ from models.rag import (
     RAGModuleInstanceSummary,
     RAGOverviewResponse,
     RAGProvidersResponse,
+    SearchRAGCollectionRequest,
 )
 
 router = APIRouter()
@@ -75,6 +80,11 @@ def install_local_module(module_id: str, payload: InstallRAGModuleRequest):
     return get_rag_service().install_local_module(module_id, payload)
 
 
+@router.delete("/modules/{module_id}/package", response_model = RAGModuleActionResponse)
+def uninstall_module_package(module_id: str):
+    return get_rag_service().uninstall_module_package(module_id)
+
+
 @router.get("/modules/instances", response_model = RAGModuleInstanceListResponse)
 def list_module_instances():
     return get_rag_service().list_module_instances()
@@ -92,6 +102,11 @@ def create_module_instance(payload: CreateRAGModuleInstanceRequest):
 @router.post("/modules/instances/{instance_id}/test", response_model = RAGModuleActionResponse)
 def test_module_instance(instance_id: str):
     return get_rag_service().test_module_instance(instance_id)
+
+
+@router.delete("/modules/instances/{instance_id}", response_model = RAGModuleActionResponse)
+def delete_module_instance(instance_id: str):
+    return get_rag_service().delete_module_instance(instance_id)
 
 
 @router.get("/connection-profiles", response_model = RAGConnectionProfileListResponse)
@@ -153,6 +168,14 @@ def append_dataset_text(dataset_id: str, payload: AppendRAGDatasetTextRequest):
         filename = document.document_name,
         size_bytes = document.size_bytes,
         status = "ok",
+        files = [
+            RAGDocumentUploadItem(
+                file_id = document.id,
+                filename = document.document_name,
+                size_bytes = document.size_bytes,
+                status = "ok",
+            )
+        ],
     )
 
 
@@ -177,6 +200,38 @@ def list_collections():
 )
 def create_collection(payload: CreateRAGCollectionRequest):
     return get_rag_service().create_collection(payload)
+
+
+@router.get(
+    "/collections/{collection_id}/inspect",
+    response_model = RAGCollectionInspectResponse,
+)
+def inspect_collection(collection_id: str):
+    return get_rag_service().inspect_collection(collection_id)
+
+
+@router.get(
+    "/collections/{collection_id}/sample-chunks",
+    response_model = RAGCollectionSampleChunksResponse,
+)
+def sample_collection_chunks(
+    collection_id: str,
+    limit: int = Query(default = 50, ge = 1, le = 200),
+    offset: int = Query(default = 0, ge = 0),
+):
+    return get_rag_service().sample_collection_chunks(
+        collection_id,
+        limit = limit,
+        offset = offset,
+    )
+
+
+@router.post(
+    "/collections/{collection_id}/search",
+    response_model = RAGCollectionSearchResponse,
+)
+def search_collection(collection_id: str, payload: SearchRAGCollectionRequest):
+    return get_rag_service().search_collection(collection_id, payload)
 
 
 @router.post(

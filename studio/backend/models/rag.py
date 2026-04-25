@@ -15,6 +15,7 @@ RAGJobType = Literal["publish", "reindex", "sync-open-webui"]
 RAGJobStatus = Literal["queued", "running", "completed", "error"]
 RAGSourceKind = Literal["documents", "normalized-text"]
 RAGDatasetStatus = Literal["empty", "ready", "processing", "error"]
+RAGDocumentProcessingStatus = Literal["processing", "ready", "error"]
 RAGConnectionStatus = Literal["healthy", "error", "disabled", "unknown"]
 RAGDocumentUploadStatus = Literal["ok", "error"]
 RAGModuleKind = Literal["extractor", "ocr", "embedder", "reranker", "chunker", "vector_store"]
@@ -199,6 +200,11 @@ class RAGDatasetDocumentSummary(BaseModel):
     text_char_count: int
     content_hash: str
     created_at: str
+    processing_status: RAGDocumentProcessingStatus = "ready"
+    processing_error: str | None = None
+    processed_at: str | None = None
+    extractor: str | None = None
+    ocr_engine: str | None = None
 
 
 class RAGDatasetSummary(BaseModel):
@@ -296,6 +302,92 @@ class RAGDiagnosticsResponse(BaseModel):
     collections: list[RAGCollectionSummary]
 
 
+class RAGCollectionInspectVectorState(BaseModel):
+    backend: RAGBackendId
+    status: str
+    physical_collection_name: str
+    details: dict[str, Any] = Field(default_factory = dict)
+    collection_info: dict[str, Any] = Field(default_factory = dict)
+
+
+class RAGCollectionChunkStats(BaseModel):
+    chunks_total: int
+    qdrant_points_total: int | None = None
+    documents_total: int
+    average_chunk_chars: float
+    min_chunk_chars: int
+    max_chunk_chars: int
+    missing_text_count: int
+    missing_indexed_at_count: int
+    inspected_limit: int
+    truncated: bool = False
+
+
+class RAGCollectionDistributionItem(BaseModel):
+    id: str
+    label: str
+    count: int
+    value: int | None = None
+
+
+class RAGCollectionInspectDistributions(BaseModel):
+    documents: list[RAGCollectionDistributionItem] = Field(default_factory = list)
+    chunk_sizes: list[RAGCollectionDistributionItem] = Field(default_factory = list)
+    indexing_statuses: list[RAGCollectionDistributionItem] = Field(default_factory = list)
+
+
+class RAGCollectionChunkPayload(BaseModel):
+    point_id: str
+    text: str
+    file_id: str | None = None
+    document_id: str | None = None
+    source: str | None = None
+    hash: str | None = None
+    extractor: str | None = None
+    ocr_engine: str | None = None
+    embedding_config: dict[str, Any] = Field(default_factory = dict)
+    chunk_recipe: str | None = None
+    indexed_at: str | None = None
+    chunk_index: int | None = None
+    payload: dict[str, Any] = Field(default_factory = dict)
+
+
+class RAGCollectionSearchResult(RAGCollectionChunkPayload):
+    score: float
+
+
+class RAGCollectionInspectResponse(BaseModel):
+    collection: RAGCollectionSummary
+    connection_profile: RAGConnectionProfileSummary
+    ingestion_profile: RAGIngestionProfileSummary
+    active_projection: RAGIndexProjectionSummary
+    qdrant: RAGCollectionInspectVectorState
+    stats: RAGCollectionChunkStats
+    distributions: RAGCollectionInspectDistributions
+    warnings: list[str] = Field(default_factory = list)
+
+
+class RAGCollectionSampleChunksResponse(BaseModel):
+    collection_id: str
+    limit: int
+    offset: int
+    next_offset: int | None = None
+    items: list[RAGCollectionChunkPayload]
+
+
+class SearchRAGCollectionRequest(BaseModel):
+    query: str = Field(min_length = 1, max_length = 4000)
+    limit: int = Field(default = 5, ge = 1, le = 50)
+
+
+class RAGCollectionSearchResponse(BaseModel):
+    collection_id: str
+    query: str
+    limit: int
+    embedding_model: str
+    results: list[RAGCollectionSearchResult]
+
+
 class CreateRAGConnectionProfileRequest(BaseModel):
     name: str = Field(min_length = 1, max_length = 120)
     backend: RAGBackendId
@@ -344,9 +436,18 @@ class PublishRAGDatasetRequest(BaseModel):
     dataset_id: str = Field(min_length = 1)
 
 
+class RAGDocumentUploadItem(BaseModel):
+    file_id: str
+    filename: str
+    size_bytes: int
+    status: RAGDocumentUploadStatus
+    error: str | None = None
+
+
 class RAGDocumentUploadResponse(BaseModel):
     file_id: str
     filename: str
     size_bytes: int
     status: RAGDocumentUploadStatus
     error: str | None = None
+    files: list[RAGDocumentUploadItem] = Field(default_factory = list)

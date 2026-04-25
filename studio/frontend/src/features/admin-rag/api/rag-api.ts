@@ -254,6 +254,11 @@ export interface RagDatasetDocumentSummary {
   text_char_count: number;
   content_hash: string;
   created_at: string;
+  processing_status: "processing" | "ready" | "error";
+  processing_error: string | null;
+  processed_at: string | null;
+  extractor: string | null;
+  ocr_engine: string | null;
 }
 
 export interface RagDatasetSummary {
@@ -350,6 +355,92 @@ export interface RagDiagnosticsResponse {
   collections: RagCollectionSummary[];
 }
 
+export interface RagCollectionInspectVectorState {
+  backend: RagBackendId;
+  status: string;
+  physical_collection_name: string;
+  details: Record<string, unknown>;
+  collection_info: Record<string, unknown>;
+}
+
+export interface RagCollectionChunkStats {
+  chunks_total: number;
+  qdrant_points_total: number | null;
+  documents_total: number;
+  average_chunk_chars: number;
+  min_chunk_chars: number;
+  max_chunk_chars: number;
+  missing_text_count: number;
+  missing_indexed_at_count: number;
+  inspected_limit: number;
+  truncated: boolean;
+}
+
+export interface RagCollectionDistributionItem {
+  id: string;
+  label: string;
+  count: number;
+  value: number | null;
+}
+
+export interface RagCollectionInspectDistributions {
+  documents: RagCollectionDistributionItem[];
+  chunk_sizes: RagCollectionDistributionItem[];
+  indexing_statuses: RagCollectionDistributionItem[];
+}
+
+export interface RagCollectionChunkPayload {
+  point_id: string;
+  text: string;
+  file_id: string | null;
+  document_id: string | null;
+  source: string | null;
+  hash: string | null;
+  extractor: string | null;
+  ocr_engine: string | null;
+  embedding_config: Record<string, unknown>;
+  chunk_recipe: string | null;
+  indexed_at: string | null;
+  chunk_index: number | null;
+  payload: Record<string, unknown>;
+}
+
+export interface RagCollectionSearchResult extends RagCollectionChunkPayload {
+  score: number;
+}
+
+export interface RagCollectionInspectResponse {
+  collection: RagCollectionSummary;
+  connection_profile: RagConnectionProfileSummary;
+  ingestion_profile: RagIngestionProfileSummary;
+  active_projection: RagIndexProjectionSummary;
+  qdrant: RagCollectionInspectVectorState;
+  stats: RagCollectionChunkStats;
+  distributions: RagCollectionInspectDistributions;
+  warnings: string[];
+}
+
+export interface RagCollectionSampleChunksResponse {
+  collection_id: string;
+  limit: number;
+  offset: number;
+  next_offset: number | null;
+  items: RagCollectionChunkPayload[];
+}
+
+export interface SearchRagCollectionParams {
+  query: string;
+  limit: number;
+}
+
+export interface RagCollectionSearchResponse {
+  collection_id: string;
+  query: string;
+  limit: number;
+  embedding_model: string;
+  results: RagCollectionSearchResult[];
+}
+
 export interface CreateRagConnectionProfileParams {
   name: string;
   backend: RagBackendId;
@@ -396,6 +487,27 @@ export interface CreateRagCollectionParams {
 
 export interface PublishRagDatasetParams {
   dataset_id: string;
+}
+
+export interface RagDocumentUploadItem {
+  file_id: string;
+  filename: string;
+  size_bytes: number;
+  status: "ok" | "error";
+  error: string | null;
+}
+
+export interface RagDocumentUploadResponse {
+  file_id: string;
+  filename: string;
+  size_bytes: number;
+  status: "ok" | "error";
+  error: string | null;
+  files: RagDocumentUploadItem[];
+}
+
+function uploadFileName(file: File): string {
+  return (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
 }
 
 export async function fetchRagOverview(): Promise<RagOverviewResponse> {
@@ -445,6 +557,14 @@ export async function installLocalRagModule(
   );
 }
 
+export async function uninstallRagModulePackage(moduleId: string): Promise<RagModuleActionResponse> {
+  return parseJson<RagModuleActionResponse>(
+    await authFetch(`/api/rag/modules/${moduleId}/package`, {
+      method: "DELETE",
+    }),
+  );
+}
+
 export async function fetchRagModuleInstances(): Promise<RagModuleInstanceListResponse> {
   return parseJson<RagModuleInstanceListResponse>(
     await authFetch("/api/rag/modules/instances"),
@@ -459,6 +579,14 @@ export async function createRagModuleInstance(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(params),
+    }),
+  );
+}
+
+export async function deleteRagModuleInstance(instanceId: string): Promise<RagModuleActionResponse> {
+  return parseJson<RagModuleActionResponse>(
+    await authFetch(`/api/rag/modules/instances/${instanceId}`, {
+      method: "DELETE",
     }),
   );
 }
@@ -530,7 +658,7 @@ export async function createRagDataset(
 export async function appendRagDatasetText(
   datasetId: string,
   params: AppendRagDatasetTextParams,
-): Promise<{ file_id: string; filename: string; size_bytes: number; status: "ok" | "error"; error: string | null }> {
+): Promise<RagDocumentUploadResponse> {
   return parseJson(
     await authFetch(`/api/rag/datasets/${datasetId}/text`, {
       method: "POST",
@@ -543,9 +671,9 @@ export async function appendRagDatasetText(
 export async function uploadRagDatasetDocument(
   datasetId: string,
   file: File,
-): Promise<{ file_id: string; filename: string; size_bytes: number; status: "ok" | "error"; error: string | null }> {
+): Promise<RagDocumentUploadResponse> {
   const formData = new FormData();
-  formData.append("file", file);
+  formData.append("file", file, uploadFileName(file));
   return parseJson(
     await authFetch(`/api/rag/datasets/${datasetId}/documents`, {
       method: "POST",
@@ -563,6 +691,47 @@ export async function createRagCollection(
 ): Promise<RagCollectionSummary> {
   return parseJson<RagCollectionSummary>(
     await authFetch("/api/rag/collections", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    }),
+  );
+}
+
+export async function fetchRagCollectionInspect(
+  collectionId: string,
+): Promise<RagCollectionInspectResponse> {
+  return parseJson<RagCollectionInspectResponse>(
+    await authFetch(`/api/rag/collections/${encodeURIComponent(collectionId)}/inspect`),
+  );
+}
+
+export async function fetchRagCollectionSampleChunks(
+  collectionId: string,
+  params: { limit?: number; offset?: number } = {},
+): Promise<RagCollectionSampleChunksResponse> {
+  const searchParams = new URLSearchParams();
+  if (params.limit !== undefined) {
+    searchParams.set("limit", String(params.limit));
+  }
+  if (params.offset !== undefined) {
+    searchParams.set("offset", String(params.offset));
+  }
+  const queryString = searchParams.toString();
+  const suffix = queryString ? `?${queryString}` : "";
+  return parseJson<RagCollectionSampleChunksResponse>(
+    await authFetch(
+      `/api/rag/collections/${encodeURIComponent(collectionId)}/sample-chunks${suffix}`,
+    ),
+  );
+}
+
+export async function searchRagCollection(
+  collectionId: string,
+  params: SearchRagCollectionParams,
+): Promise<RagCollectionSearchResponse> {
+  return parseJson<RagCollectionSearchResponse>(
+    await authFetch(`/api/rag/collections/${encodeURIComponent(collectionId)}/search`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(params),

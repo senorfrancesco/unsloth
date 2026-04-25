@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
+import io
 import os
 import sys
 import types
+import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -23,8 +26,10 @@ if "structlog" not in sys.modules:
         get_logger = lambda *args, **kwargs: _DummyLogger(),
     )
 
+import core.rag.service as rag_service_module
 from core.rag.service import RAGService, reset_rag_service
 from core.rag.storage import SQLiteRAGRepository
+from models.rag import RAGModuleInstallationSummary
 
 _rag_route_path = Path(__file__).resolve().parent.parent / "routes" / "rag.py"
 _rag_spec = importlib.util.spec_from_file_location("test_routes_rag", _rag_route_path)
@@ -45,12 +50,73 @@ class FakeEmbeddingProvider:
 class FakeVectorStoreAdapter:
     def __init__(self) -> None:
         self.collections: dict[str, list[dict[str, object]]] = {}
+        self.health_status = "healthy"
 
     def health_check(self) -> dict[str, object]:
         return {
-            "status": "healthy",
+            "status": self.health_status,
             "details": {"backend": "qdrant", "transport": "fake"},
         }
+
+    def get_collection_info(self, *, collection_name: str) -> dict[str, object]:
+        if collection_name not in self.collections:
+            return {
+                "status": "missing",
+                "details": {"collection_name": collection_name},
+            }
+        return {
+            "status": "found",
+            "details": {
+                "status": "green",
+                "points_count": len(self.collections[collection_name]),
+            },
+        }
+
+    def scroll_points(
+        self,
+        *,
+        collection_name: str,
+        limit: int,
+        offset: object | None = None,
+    ) -> dict[str, object]:
+        if self.health_status != "healthy":
+            raise RuntimeError("Qdrant is unavailable")
+        items = self.collections.get(collection_name, [])
+        start = offset if isinstance(offset, int) else 0
+        page = items[start : start + limit]
+        next_offset = start + len(page) if start + len(page) < len(items) else None
+        return {
+            "points": [
+                {"id": point["id"], "payload": point["payload"]}
+                for point in page
+            ],
+            "next_page_offset": next_offset,
+        }
+
+    def search_points(
+        self,
+        *,
+        collection_name: str,
+        vector: list[float],
+        limit: int,
+    ) -> dict[str, object]:
+        if self.health_status != "healthy":
+            raise RuntimeError("Qdrant is unavailable")
+        scored: list[dict[str, object]] = []
+        for point in self.collections.get(collection_name, []):
+            stored_vector = point.get("vector")
+            score = 0.0
+            if isinstance(stored_vector, list):
+                score = sum(float(left) * float(right) for left, right in zip(vector, stored_vector))
+            scored.append(
+                {
+                    "id": point["id"],
+                    "score": score,
+                    "payload": point["payload"],
+                }
+            )
+        scored.sort(key = lambda item: float(item["score"]), reverse = True)
+        return {"points": scored[:limit]}
 
     def ensure_collection(self, *, collection_name: str, vector_size: int) -> None:
         self.collections.setdefault(collection_name, [])
@@ -161,7 +227,7 @@ def test_overview_and_profiles_are_exposed(tmp_path: Path):
     assert ingestion_profiles.json()["items"][0]["id"] == ingestion["id"]
 
 
-def test_modules_catalog_checks_instances_and_ingestion_overrides(tmp_path: Path):
+def test_modules_catalog_checks_instances_and_ingestion_overrides(tmp_path: Path, monkeypatch):
     client = create_client(tmp_path)
 
     catalog_response = client.get("/api/rag/modules/catalog")
@@ -255,6 +321,29 @@ def test_modules_catalog_checks_instances_and_ingestion_overrides(tmp_path: Path
     }
     assert first_payload["ocr_engine"] == "none"
 
+    delete_response = client.delete(f"/api/rag/modules/instances/{module_instance['id']}")
+    assert delete_response.status_code == 200
+    assert delete_response.json()["details"]["deleted_files"] is False
+    assert delete_response.json()["details"]["cleared_ingestion_profile_ids"] == [ingestion["id"]]
+    assert client.get("/api/rag/modules/instances").json()["items"] == []
+    refreshed_ingestion = client.get("/api/rag/ingestion-profiles").json()["items"][0]
+    assert refreshed_ingestion["embedder_instance_id"] is None
+
+    def fake_uninstall(item):
+        return RAGModuleInstallationSummary(
+            module_id = item.id,
+            kind = item.kind,
+            source_type = item.source_type,
+            status = "missing",
+            last_checked_at = "2026-04-24T00:00:00+00:00",
+            last_error = None,
+        )
+
+    monkeypatch.setattr(rag_service_module, "uninstall_catalog_module", fake_uninstall)
+    uninstall_response = client.delete("/api/rag/modules/docling/package")
+    assert uninstall_response.status_code == 200
+    assert uninstall_response.json()["status"] == "missing"
+
 
 def test_text_dataset_publish_updates_collection_and_jobs(tmp_path: Path):
     client = create_client(tmp_path)
@@ -307,6 +396,133 @@ def test_text_dataset_publish_updates_collection_and_jobs(tmp_path: Path):
     jobs_response = client.get("/api/rag/jobs")
     assert jobs_response.status_code == 200
     assert jobs_response.json()["items"][0]["id"] == publish_job["id"]
+
+
+def test_collection_inspector_handles_empty_collection(tmp_path: Path):
+    client = create_client(tmp_path)
+    connection = _create_connection_profile(client)
+    ingestion = _create_ingestion_profile(client)
+    collection = _create_collection(client, connection, ingestion)
+
+    inspect_response = client.get(f"/api/rag/collections/{collection['id']}/inspect")
+    assert inspect_response.status_code == 200
+    inspect_payload = inspect_response.json()
+    assert inspect_payload["collection"]["id"] == collection["id"]
+    assert inspect_payload["active_projection"]["status"] == "pending"
+    assert inspect_payload["qdrant"]["status"] == "missing"
+    assert inspect_payload["stats"]["chunks_total"] == 0
+    assert inspect_payload["warnings"]
+
+    sample_response = client.get(f"/api/rag/collections/{collection['id']}/sample-chunks")
+    assert sample_response.status_code == 200
+    assert sample_response.json()["items"] == []
+
+
+def test_collection_inspector_samples_and_searches_published_chunks(tmp_path: Path):
+    client = create_client(tmp_path)
+    connection = _create_connection_profile(client)
+    ingestion = _create_ingestion_profile(client)
+    collection = _create_collection(client, connection, ingestion)
+
+    dataset = client.post(
+        "/api/rag/datasets",
+        json = {
+            "name": "Searchable Docs",
+            "source_kind": "normalized-text",
+        },
+    ).json()
+    append_response = client.post(
+        f"/api/rag/datasets/{dataset['id']}/text",
+        json = {
+            "document_name": "retrieval.md",
+            "text": "Alpha beta gamma. Retrieval should find this document. " * 90,
+        },
+    )
+    assert append_response.status_code == 201
+
+    publish_response = client.post(
+        f"/api/rag/collections/{collection['id']}/publish",
+        json = {"dataset_id": dataset["id"]},
+    )
+    assert publish_response.status_code == 201
+
+    inspect_response = client.get(f"/api/rag/collections/{collection['id']}/inspect")
+    assert inspect_response.status_code == 200
+    inspect_payload = inspect_response.json()
+    assert inspect_payload["qdrant"]["status"] == "healthy"
+    assert inspect_payload["stats"]["chunks_total"] > 0
+    assert inspect_payload["stats"]["documents_total"] == 1
+    assert inspect_payload["distributions"]["documents"][0]["label"] == "retrieval.md"
+    assert inspect_payload["distributions"]["chunk_sizes"]
+    assert inspect_payload["distributions"]["indexing_statuses"][0]["label"] == "indexed"
+
+    sample_response = client.get(
+        f"/api/rag/collections/{collection['id']}/sample-chunks",
+        params = {"limit": 2, "offset": 0},
+    )
+    assert sample_response.status_code == 200
+    sample_payload = sample_response.json()
+    assert len(sample_payload["items"]) == 2
+    sample_chunk = sample_payload["items"][0]
+    assert "vector" not in sample_chunk
+    assert sample_chunk["text"]
+    assert sample_chunk["file_id"]
+    assert sample_chunk["document_id"]
+    assert sample_chunk["source"] == "retrieval.md"
+    assert sample_chunk["indexed_at"]
+    assert sample_chunk["embedding_config"] == {
+        "engine": "fake-embeddings",
+        "model": "bge-m3",
+    }
+
+    search_response = client.post(
+        f"/api/rag/collections/{collection['id']}/search",
+        json = {"query": "gamma retrieval", "limit": 3},
+    )
+    assert search_response.status_code == 200
+    search_payload = search_response.json()
+    assert search_payload["embedding_model"] == "bge-m3"
+    assert len(search_payload["results"]) == 3
+    assert search_payload["results"][0]["score"] >= search_payload["results"][-1]["score"]
+    assert "Retrieval should find" in search_payload["results"][0]["text"]
+
+
+def test_collection_inspector_reports_unhealthy_qdrant(tmp_path: Path):
+    client = create_client(tmp_path)
+    connection = _create_connection_profile(client)
+    ingestion = _create_ingestion_profile(client)
+    collection = _create_collection(client, connection, ingestion)
+    adapter = client.app.state.rag_fake_adapter
+    adapter.health_status = "error"
+
+    inspect_response = client.get(f"/api/rag/collections/{collection['id']}/inspect")
+    assert inspect_response.status_code == 200
+    inspect_payload = inspect_response.json()
+    assert inspect_payload["qdrant"]["status"] == "error"
+    assert "not healthy" in inspect_payload["warnings"][0]
+
+    sample_response = client.get(f"/api/rag/collections/{collection['id']}/sample-chunks")
+    assert sample_response.status_code == 503
+    assert "Failed to read Qdrant collection chunks" in sample_response.json()["detail"]
+
+
+def test_collection_inspector_rejects_unsupported_backend(tmp_path: Path):
+    client = create_client(tmp_path)
+    connection_response = client.post(
+        "/api/rag/connection-profiles",
+        json = {
+            "name": "Postgres Preview",
+            "backend": "pgvector",
+            "base_url": "postgresql://pgvector.internal/rag",
+        },
+    )
+    assert connection_response.status_code == 201
+    ingestion = _create_ingestion_profile(client)
+    collection = _create_collection(client, connection_response.json(), ingestion)
+
+    inspect_response = client.get(f"/api/rag/collections/{collection['id']}/inspect")
+    assert inspect_response.status_code == 400
+    assert "Qdrant" in inspect_response.json()["detail"]
 
 
 def test_publish_uses_projection_metadata_and_reindex_creates_new_projection(tmp_path: Path):
@@ -362,6 +578,7 @@ def test_publish_uses_projection_metadata_and_reindex_creates_new_projection(tmp
         "engine": "fake-embeddings",
         "model": "bge-m3",
     }
+    assert first_payload["indexed_at"]
     assert isinstance(first_payload["start_index"], int)
     assert first_payload["page"] is None
     assert first_payload["language"] is None
@@ -400,6 +617,12 @@ def test_reindex_uses_extracted_text_and_reports_missing_artifact(tmp_path: Path
     )
     assert upload_response.status_code == 201
     assert upload_response.json()["status"] == "ok"
+    dataset_detail = client.get(f"/api/rag/datasets/{dataset['id']}").json()
+    uploaded_document = dataset_detail["documents"][0]
+    assert uploaded_document["processing_status"] == "ready"
+    assert uploaded_document["processing_error"] is None
+    assert uploaded_document["processed_at"]
+    assert uploaded_document["extractor"] == "builtin-file"
 
     publish_response = client.post(
         f"/api/rag/collections/{collection['id']}/publish",
@@ -431,3 +654,96 @@ def test_reindex_uses_extracted_text_and_reports_missing_artifact(tmp_path: Path
     assert payload["collections"][0]["active_projection"]["version"] == 2
     assert payload["collections"][0]["last_job_status"] == "error"
     assert "Missing extracted text artifact" in payload["collections"][0]["last_error"]
+
+
+def test_zip_upload_expands_supported_documents(tmp_path: Path):
+    client = create_client(tmp_path)
+    dataset = client.post(
+        "/api/rag/datasets",
+        json = {
+            "name": "Archive Uploads",
+            "source_kind": "documents",
+        },
+    ).json()
+
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w") as archive:
+        archive.writestr("docs/first.txt", "First document text.\n" * 8)
+        archive.writestr("docs/second.md", "# Second\n\nSecond document text.\n" * 8)
+        archive.writestr("images/ignored.png", b"not indexed")
+
+    upload_response = client.post(
+        f"/api/rag/datasets/{dataset['id']}/documents",
+        files = {
+            "file": ("bundle.zip", archive_buffer.getvalue(), "application/zip"),
+        },
+    )
+    assert upload_response.status_code == 201
+    upload_payload = upload_response.json()
+    assert upload_payload["status"] == "ok"
+    assert len(upload_payload["files"]) == 2
+    assert {item["filename"] for item in upload_payload["files"]} == {
+        "docs/first.txt",
+        "docs/second.md",
+    }
+
+    dataset_detail = client.get(f"/api/rag/datasets/{dataset['id']}").json()
+    assert dataset_detail["dataset"]["documents_count"] == 2
+    assert dataset_detail["dataset"]["status"] == "ready"
+    assert {item["document_name"] for item in dataset_detail["documents"]} == {
+        "docs/first.txt",
+        "docs/second.md",
+    }
+    assert all(item["processing_status"] == "ready" for item in dataset_detail["documents"])
+
+
+def test_gzip_upload_creates_inner_document(tmp_path: Path):
+    client = create_client(tmp_path)
+    dataset = client.post(
+        "/api/rag/datasets",
+        json = {
+            "name": "Compressed Uploads",
+            "source_kind": "documents",
+        },
+    ).json()
+
+    upload_response = client.post(
+        f"/api/rag/datasets/{dataset['id']}/documents",
+        files = {
+            "file": ("notes.txt.gz", gzip.compress(b"Compressed text.\n" * 10), "application/gzip"),
+        },
+    )
+    assert upload_response.status_code == 201
+    upload_payload = upload_response.json()
+    assert len(upload_payload["files"]) == 1
+    assert upload_payload["files"][0]["filename"] == "notes.txt"
+
+    dataset_detail = client.get(f"/api/rag/datasets/{dataset['id']}").json()
+    assert dataset_detail["dataset"]["documents_count"] == 1
+    assert dataset_detail["documents"][0]["document_name"] == "notes.txt"
+
+
+def test_file_upload_processing_error_is_visible_on_dataset(tmp_path: Path):
+    client = create_client(tmp_path)
+    dataset = client.post(
+        "/api/rag/datasets",
+        json = {
+            "name": "Bad Uploads",
+            "source_kind": "documents",
+        },
+    ).json()
+
+    upload_response = client.post(
+        f"/api/rag/datasets/{dataset['id']}/documents",
+        files = {
+            "file": ("archive.zip", b"not a document", "application/zip"),
+        },
+    )
+    assert upload_response.status_code == 422
+    assert "zip" in upload_response.json()["detail"]
+
+    datasets_response = client.get("/api/rag/datasets")
+    assert datasets_response.status_code == 200
+    updated_dataset = datasets_response.json()["items"][0]
+    assert updated_dataset["status"] == "error"
+    assert "zip" in updated_dataset["last_error"]

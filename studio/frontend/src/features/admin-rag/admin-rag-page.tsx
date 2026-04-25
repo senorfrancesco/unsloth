@@ -5,6 +5,12 @@ import { SectionCard } from "@/components/section-card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+  type ChartConfig,
+} from "@/components/ui/chart";
+import {
   Empty,
   EmptyContent,
   EmptyDescription,
@@ -22,12 +28,21 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { toastError, toastSuccess } from "@/shared/toast";
+import { FolderBrowser } from "@/components/assistant-ui/model-selector/folder-browser";
 import {
+  RAGCatalogModuleSelector,
   RAGModuleCatalogBrowser,
   RAGModuleSelector,
   moduleStatusVariant,
@@ -35,6 +50,11 @@ import {
 import {
   type RagCollectionSummary,
   type RagBackendId,
+  type RagCollectionChunkPayload,
+  type RagCollectionDistributionItem,
+  type RagCollectionInspectResponse,
+  type RagCollectionSampleChunksResponse,
+  type RagCollectionSearchResponse,
   type RagConnectionDiagnostic,
   type RagConnectionProfileSummary,
   type RagDatasetSummary,
@@ -55,7 +75,10 @@ import {
   createRagDataset,
   createRagIngestionProfile,
   createRagModuleInstance,
+  deleteRagModuleInstance,
   fetchRagCollections,
+  fetchRagCollectionInspect,
+  fetchRagCollectionSampleChunks,
   fetchRagConnectionProfiles,
   fetchRagDatasets,
   fetchRagDiagnostics,
@@ -70,8 +93,10 @@ import {
   installRagModule,
   publishRagDatasetToCollection,
   reindexRagCollection,
+  searchRagCollection,
   syncRagCollectionToOpenWebUi,
   testRagModuleInstance,
+  uninstallRagModulePackage,
   uploadRagDatasetDocument,
 } from "./api/rag-api";
 import {
@@ -83,6 +108,7 @@ import {
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useCallback, useEffect, useMemo, useState, type ChangeEvent, type FormEvent } from "react";
+import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts";
 
 type AdminRagTab = "configure" | "modules" | "datasets" | "collections" | "jobs";
 
@@ -123,6 +149,7 @@ type ModuleFormState = {
 
 type LocalInstallFormState = {
   moduleId: string;
+  sourceMode: "package" | "wheelhouse";
   packagePath: string;
   wheelhousePath: string;
 };
@@ -197,6 +224,7 @@ const EMPTY_MODULE_FORM: ModuleFormState = {
 
 const EMPTY_LOCAL_INSTALL_FORM: LocalInstallFormState = {
   moduleId: "",
+  sourceMode: "wheelhouse",
   packagePath: "",
   wheelhousePath: "",
 };
@@ -227,6 +255,16 @@ const EMPTY_PUBLISH_FORM: PublishFormState = {
 
 function metricLabel(value: number): string {
   return new Intl.NumberFormat("en-US").format(value);
+}
+
+function fileSizeLabel(value: number): string {
+  if (value < 1024) {
+    return `${value} B`;
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} KB`;
+  }
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function jobStatusVariant(status: RagJobStatus): "default" | "secondary" | "destructive" | "outline" {
@@ -312,6 +350,372 @@ function moduleCatalogTarget(
   );
 }
 
+function moduleSourceLabel(sourceType: RagModuleSourceType): string {
+  switch (sourceType) {
+    case "local_model_path":
+      return "Local model path";
+    case "service_url":
+      return "Service URL";
+    case "system_binary":
+      return "System binary";
+    case "python_package":
+      return "Python package";
+    case "builtin":
+      return "Built-in";
+    case "wheel":
+      return "Wheel file";
+    case "wheelhouse":
+      return "Wheelhouse";
+    default:
+      return sourceType;
+  }
+}
+
+function moduleSourceHint(sourceType: RagModuleSourceType): string {
+  switch (sourceType) {
+    case "local_model_path":
+      return "Use this for model folders such as BGE or reranker checkpoints.";
+    case "service_url":
+      return "Use this for services such as Qdrant endpoints.";
+    case "system_binary":
+      return "Use this for tools resolved from PATH or by absolute binary path.";
+    case "python_package":
+      return "Python packages are installed through the catalog or offline package installer.";
+    case "builtin":
+      return "Built-in modules do not need an external path.";
+    default:
+      return sourceType;
+  }
+}
+
+function defaultLocalPathForModule(item: RagModuleCatalogItem | undefined): string {
+  const value = item?.config_schema.local_path;
+  return typeof value === "string" ? value : "";
+}
+
+const INSPECTOR_CHART_CONFIG = {
+  count: { label: "Chunks", color: "#2563eb" },
+} satisfies ChartConfig;
+
+const RAG_UPLOAD_ACCEPT = ".txt,.md,.pdf,.docx,.zip,.tar,.tar.gz,.tgz,.gz,.rar";
+const DIRECTORY_INPUT_PROPS = {
+  webkitdirectory: "",
+  directory: "",
+} as Record<string, string>;
+
+function compactJson(value: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "{}";
+  }
+}
+
+function InspectorMetric({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div className="rounded-2xl border border-border/70 bg-background/80 px-4 py-3">
+      <div className="text-[11px] uppercase tracking-[0.08em] text-muted-foreground">{label}</div>
+      <div className="mt-1 truncate text-lg font-semibold tracking-tight">{value}</div>
+    </div>
+  );
+}
+
+function fileDisplayName(file: File): string {
+  return (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+}
+
+function InspectorDistributionChart({
+  title,
+  data,
+}: {
+  title: string;
+  data: RagCollectionDistributionItem[];
+}) {
+  const visibleData = data.slice(0, 10).map((item) => ({
+    ...item,
+    label: item.label.length > 28 ? `${item.label.slice(0, 25)}...` : item.label,
+  }));
+  return (
+    <div className="rounded-2xl border border-border/70 bg-background/80 p-4">
+      <div className="text-sm font-semibold">{title}</div>
+      {visibleData.length > 0 ? (
+        <ChartContainer config={INSPECTOR_CHART_CONFIG} className="mt-3 h-[220px] w-full">
+          <BarChart data={visibleData} layout="vertical" margin={{ left: 8, right: 12 }}>
+            <CartesianGrid horizontal={false} strokeDasharray="3 3" />
+            <XAxis type="number" allowDecimals={false} tickLine={false} axisLine={false} fontSize={10} />
+            <YAxis
+              dataKey="label"
+              type="category"
+              width={112}
+              tickLine={false}
+              axisLine={false}
+              fontSize={10}
+            />
+            <ChartTooltip content={<ChartTooltipContent hideLabel />} />
+            <Bar dataKey="count" fill="var(--color-count)" radius={4} />
+          </BarChart>
+        </ChartContainer>
+      ) : (
+        <div className="mt-3 text-sm text-muted-foreground">No data yet.</div>
+      )}
+    </div>
+  );
+}
+
+function InspectorChunkCard({ chunk }: { chunk: RagCollectionChunkPayload }) {
+  return (
+    <div className="rounded-2xl border border-border/70 bg-background/80 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold">{chunk.source || chunk.document_id || chunk.point_id}</div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {chunk.chunk_index !== null ? `chunk ${chunk.chunk_index}` : "chunk"} · {chunk.text.length} chars
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {chunk.extractor ? <Badge variant="outline">{chunk.extractor}</Badge> : null}
+          {chunk.ocr_engine ? <Badge variant="outline">{chunk.ocr_engine}</Badge> : null}
+        </div>
+      </div>
+      <div className="mt-3 max-h-28 overflow-y-auto rounded-xl border border-border/60 bg-muted/30 p-3 text-xs leading-relaxed text-foreground">
+        {chunk.text || <span className="text-muted-foreground">No text payload.</span>}
+      </div>
+      <div className="mt-3 grid gap-2 text-xs text-muted-foreground sm:grid-cols-2">
+        <div className="truncate">file_id: {chunk.file_id || "n/a"}</div>
+        <div className="truncate">document_id: {chunk.document_id || "n/a"}</div>
+        <div className="truncate">hash: {chunk.hash || "n/a"}</div>
+        <div className="truncate">indexed_at: {chunk.indexed_at || "n/a"}</div>
+      </div>
+    </div>
+  );
+}
+
+function CollectionInspectorSheet({
+  collectionId,
+  open,
+  onOpenChange,
+}: {
+  collectionId: string | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const [inspect, setInspect] = useState<RagCollectionInspectResponse | null>(null);
+  const [chunks, setChunks] = useState<RagCollectionSampleChunksResponse | null>(null);
+  const [search, setSearch] = useState<RagCollectionSearchResponse | null>(null);
+  const [query, setQuery] = useState("");
+  const [topK, setTopK] = useState("5");
+  const [loadingInspect, setLoadingInspect] = useState(false);
+  const [loadingSearch, setLoadingSearch] = useState(false);
+
+  const loadInspector = useCallback(async () => {
+    if (!collectionId) {
+      return;
+    }
+    setLoadingInspect(true);
+    try {
+      const [inspectData, chunkData] = await Promise.all([
+        fetchRagCollectionInspect(collectionId),
+        fetchRagCollectionSampleChunks(collectionId, { limit: 50, offset: 0 }),
+      ]);
+      setInspect(inspectData);
+      setChunks(chunkData);
+      setSearch(null);
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : "Failed to inspect RAG collection.");
+      setInspect(null);
+      setChunks(null);
+    } finally {
+      setLoadingInspect(false);
+    }
+  }, [collectionId]);
+
+  useEffect(() => {
+    if (open && collectionId) {
+      void loadInspector();
+    }
+  }, [collectionId, loadInspector, open]);
+
+  const runSearch = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (!collectionId) {
+        return;
+      }
+      const trimmedQuery = query.trim();
+      if (!trimmedQuery) {
+        toastError("Enter a retrieval query.");
+        return;
+      }
+      const limit = Math.min(Math.max(Number(topK) || 5, 1), 50);
+      setLoadingSearch(true);
+      try {
+        setSearch(await searchRagCollection(collectionId, { query: trimmedQuery, limit }));
+      } catch (error) {
+        toastError(error instanceof Error ? error.message : "RAG retrieval test failed.");
+      } finally {
+        setLoadingSearch(false);
+      }
+    },
+    [collectionId, query, topK],
+  );
+
+  const collectionName = inspect?.collection.name || "Collection Inspector";
+  const chunkItems = chunks?.items ?? [];
+  const searchResults = search?.results ?? [];
+
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent side="right" className="w-full overflow-y-auto p-0 sm:max-w-none md:w-[46rem] xl:w-[64rem]">
+        <SheetHeader className="border-b border-border/70 px-6 py-5">
+          <SheetTitle>{collectionName}</SheetTitle>
+          <SheetDescription>
+            {inspect?.active_projection.physical_collection_name || "Active projection payload and retrieval checks."}
+          </SheetDescription>
+        </SheetHeader>
+
+        <div className="flex-1 overflow-y-auto px-6 py-5">
+          {loadingInspect && !inspect ? (
+            <div className="flex min-h-[18rem] items-center justify-center">
+              <Spinner className="size-8" />
+            </div>
+          ) : inspect ? (
+            <Tabs defaultValue="overview" className="gap-4">
+              <TabsList variant="line" className="flex-wrap">
+                <TabsTrigger value="overview">Overview</TabsTrigger>
+                <TabsTrigger value="chunks">Chunks</TabsTrigger>
+                <TabsTrigger value="retrieval">Test Retrieval</TabsTrigger>
+                <TabsTrigger value="map">Vector Map</TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="overview" className="pt-4">
+                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                  <InspectorMetric label="Qdrant" value={inspect.qdrant.status} />
+                  <InspectorMetric label="Chunks" value={metricLabel(inspect.stats.chunks_total)} />
+                  <InspectorMetric label="Documents" value={metricLabel(inspect.stats.documents_total)} />
+                  <InspectorMetric label="Avg chars" value={inspect.stats.average_chunk_chars} />
+                </div>
+
+                <div className="mt-4 grid gap-4 lg:grid-cols-2">
+                  <div className="rounded-2xl border border-border/70 bg-background/80 p-4">
+                    <div className="text-sm font-semibold">Ingestion Profile</div>
+                    <div className="mt-3 grid gap-2 text-xs text-muted-foreground">
+                      <div>profile: {inspect.ingestion_profile.name}</div>
+                      <div>extractor: {inspect.ingestion_profile.extractor}</div>
+                      <div>ocr: {inspect.ingestion_profile.ocr_engine}</div>
+                      <div>embedder: {inspect.ingestion_profile.embedder}</div>
+                      <div>chunking: {inspect.ingestion_profile.chunk_size} / {inspect.ingestion_profile.chunk_overlap}</div>
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-border/70 bg-background/80 p-4">
+                    <div className="text-sm font-semibold">Active Projection</div>
+                    <div className="mt-3 grid gap-2 text-xs text-muted-foreground">
+                      <div>version: v{inspect.active_projection.version}</div>
+                      <div>status: {inspect.active_projection.status}</div>
+                      <div>model: {inspect.active_projection.embedding_model}</div>
+                      <div>indexed_at: {inspect.active_projection.indexed_at || "n/a"}</div>
+                      <div className="break-words">physical: {inspect.active_projection.physical_collection_name}</div>
+                    </div>
+                  </div>
+                </div>
+
+                {inspect.warnings.length > 0 ? (
+                  <div className="mt-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4">
+                    <div className="text-sm font-semibold text-amber-700">Warnings</div>
+                    <div className="mt-2 space-y-1 text-xs text-amber-800">
+                      {inspect.warnings.map((warning) => (
+                        <div key={warning}>{warning}</div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </TabsContent>
+
+              <TabsContent value="chunks" className="pt-4">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm text-muted-foreground">
+                    Showing {metricLabel(chunkItems.length)} sampled chunks from payload only.
+                  </div>
+                  <Button variant="outline" size="sm" onClick={() => void loadInspector()} disabled={loadingInspect}>
+                    {loadingInspect ? <Spinner className="size-4" /> : "Refresh"}
+                  </Button>
+                </div>
+                <div className="space-y-3">
+                  {chunkItems.length > 0 ? chunkItems.map((chunk) => (
+                    <InspectorChunkCard key={chunk.point_id} chunk={chunk} />
+                  )) : (
+                    <div className="rounded-2xl border border-border/70 bg-background/80 p-4 text-sm text-muted-foreground">
+                      No chunk payloads are available for this projection.
+                    </div>
+                  )}
+                </div>
+              </TabsContent>
+
+              <TabsContent value="retrieval" className="pt-4">
+                <form className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_7rem_auto]" onSubmit={runSearch}>
+                  <Input
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                    placeholder="Ask a test query"
+                  />
+                  <Input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={topK}
+                    onChange={(event) => setTopK(event.target.value)}
+                    aria-label="Top K"
+                  />
+                  <Button type="submit" disabled={loadingSearch}>
+                    {loadingSearch ? <Spinner className="size-4" /> : "Search"}
+                  </Button>
+                </form>
+                <div className="mt-4 space-y-3">
+                  {searchResults.length > 0 ? searchResults.map((result) => (
+                    <div key={`${result.point_id}:${result.score}`} className="rounded-2xl border border-border/70 bg-background/80 p-4">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="truncate text-sm font-semibold">{result.source || result.document_id || result.point_id}</div>
+                          <div className="mt-1 text-xs text-muted-foreground">score: {result.score.toFixed(4)}</div>
+                        </div>
+                        <Badge variant="outline">{result.chunk_recipe || "chunk"}</Badge>
+                      </div>
+                      <div className="mt-3 max-h-28 overflow-y-auto rounded-xl border border-border/60 bg-muted/30 p-3 text-xs leading-relaxed">
+                        {result.text}
+                      </div>
+                      <div className="mt-3 truncate text-xs text-muted-foreground">
+                        payload: {compactJson(result.payload)}
+                      </div>
+                    </div>
+                  )) : (
+                    <div className="rounded-2xl border border-border/70 bg-background/80 p-4 text-sm text-muted-foreground">
+                      No retrieval results yet.
+                    </div>
+                  )}
+                </div>
+              </TabsContent>
+
+              <TabsContent value="map" className="pt-4">
+                <div className="grid gap-4 lg:grid-cols-2">
+                  <InspectorDistributionChart title="Chunks by Document" data={inspect.distributions.documents} />
+                  <InspectorDistributionChart title="Chunk Sizes" data={inspect.distributions.chunk_sizes} />
+                  <InspectorDistributionChart title="Indexing Status" data={inspect.distributions.indexing_statuses} />
+                </div>
+                <div className="mt-4 rounded-2xl border border-border/70 bg-background/80 p-4 text-xs text-muted-foreground">
+                  2D vector projection is intentionally deferred; this view uses payload distributions only.
+                </div>
+              </TabsContent>
+            </Tabs>
+          ) : (
+            <div className="rounded-2xl border border-border/70 bg-background/80 p-4 text-sm text-muted-foreground">
+              Choose a collection to inspect.
+            </div>
+          )}
+        </div>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
 export function AdminRagPage() {
   const [overview, setOverview] = useState<RagOverviewResponse | null>(null);
   const [providers, setProviders] = useState<Awaited<ReturnType<typeof fetchRagProviders>> | null>(null);
@@ -335,8 +739,13 @@ export function AdminRagPage() {
   const [collectionForm, setCollectionForm] = useState(EMPTY_COLLECTION_FORM);
   const [publishForm, setPublishForm] = useState(EMPTY_PUBLISH_FORM);
   const [uploadDatasetId, setUploadDatasetId] = useState("");
-  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadFiles, setUploadFiles] = useState<File[]>([]);
+  const [uploadInputKey, setUploadInputKey] = useState(0);
   const [activeTab, setActiveTab] = useState<AdminRagTab>("configure");
+  const [inspectorCollectionId, setInspectorCollectionId] = useState<string | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [modelPathBrowserOpen, setModelPathBrowserOpen] = useState(false);
+  const [offlineWheelhouseBrowserOpen, setOfflineWheelhouseBrowserOpen] = useState(false);
 
   const reloadAll = useCallback(async () => {
     const [
@@ -504,12 +913,28 @@ export function AdminRagPage() {
     [moduleCatalog],
   );
 
+  const moduleComponentCatalog = useMemo(
+    () => moduleCatalog.filter((item) => item.kind !== "vector_store"),
+    [moduleCatalog],
+  );
+
+  const moduleComponentCatalogById = useMemo(
+    () => new Map(moduleComponentCatalog.map((item) => [item.id, item])),
+    [moduleComponentCatalog],
+  );
+
+  const moduleComponentInstances = useMemo(
+    () => moduleInstances.filter((item) => item.kind !== "vector_store"),
+    [moduleInstances],
+  );
+
   const moduleInstancesById = useMemo(
     () => new Map(moduleInstances.map((item) => [item.id, item])),
     [moduleInstances],
   );
 
-  const selectedModule = moduleCatalogById.get(moduleForm.moduleId) ?? null;
+  const selectedModule = moduleComponentCatalogById.get(moduleForm.moduleId) ?? null;
+  const selectedLocalInstallModule = moduleCatalogById.get(localInstallForm.moduleId) ?? null;
 
   const selectedCollectionIngestionProfile = useMemo(
     () => ingestionProfiles.find((item) => item.id === collectionForm.ingestionProfileId) ?? null,
@@ -732,6 +1157,17 @@ export function AdminRagPage() {
     [reloadAll, withBusyAction],
   );
 
+  const onUninstallModulePackage = useCallback(
+    async (moduleId: string) => {
+      await withBusyAction(`module-uninstall:${moduleId}`, async () => {
+        const response = await uninstallRagModulePackage(moduleId);
+        await reloadAll();
+        toastSuccess(`Module uninstall: ${response.status}.`);
+      });
+    },
+    [reloadAll, withBusyAction],
+  );
+
   const onInstallLocalModule = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
@@ -739,14 +1175,18 @@ export function AdminRagPage() {
         toastError("Choose a module first.");
         return;
       }
-      if (!localInstallForm.packagePath.trim() && !localInstallForm.wheelhousePath.trim()) {
-        toastError("Set a wheel file path or a wheelhouse path.");
+      if (localInstallForm.sourceMode === "package" && !localInstallForm.packagePath.trim()) {
+        toastError("Set a wheel file path.");
+        return;
+      }
+      if (localInstallForm.sourceMode === "wheelhouse" && !localInstallForm.wheelhousePath.trim()) {
+        toastError("Set a wheelhouse folder path.");
         return;
       }
       await withBusyAction("module-install-local", async () => {
         const response = await installLocalRagModule(localInstallForm.moduleId, {
-          package_path: localInstallForm.packagePath.trim() || null,
-          wheelhouse_path: localInstallForm.wheelhousePath.trim() || null,
+          package_path: localInstallForm.sourceMode === "package" ? localInstallForm.packagePath.trim() || null : null,
+          wheelhouse_path: localInstallForm.sourceMode === "wheelhouse" ? localInstallForm.wheelhousePath.trim() || null : null,
         });
         setLocalInstallForm((current) => ({ ...current, packagePath: "", wheelhousePath: "" }));
         await reloadAll();
@@ -754,6 +1194,17 @@ export function AdminRagPage() {
       });
     },
     [localInstallForm, reloadAll, withBusyAction],
+  );
+
+  const onDeleteModuleInstance = useCallback(
+    async (instanceId: string) => {
+      await withBusyAction(`module-instance-delete:${instanceId}`, async () => {
+        await deleteRagModuleInstance(instanceId);
+        await reloadAll();
+        toastSuccess("Module instance record deleted.");
+      });
+    },
+    [reloadAll, withBusyAction],
   );
 
   const onCreateModuleInstance = useCallback(
@@ -767,15 +1218,16 @@ export function AdminRagPage() {
         toastError("Choose a module.");
         return;
       }
-      if (moduleForm.sourceType === "local_model_path" && !moduleForm.localPath.trim() && !moduleForm.modelId.trim()) {
+      const sourceType = selectedModule?.source_type ?? moduleForm.sourceType;
+      if (sourceType === "local_model_path" && !moduleForm.localPath.trim() && !moduleForm.modelId.trim()) {
         toastError("Set a local model path or model ID.");
         return;
       }
-      if (moduleForm.sourceType === "service_url" && !moduleForm.serviceUrl.trim()) {
+      if (sourceType === "service_url" && !moduleForm.serviceUrl.trim()) {
         toastError("Set a service URL.");
         return;
       }
-      if (moduleForm.sourceType === "system_binary" && !moduleForm.binaryPath.trim()) {
+      if (sourceType === "system_binary" && !moduleForm.binaryPath.trim()) {
         toastError("Set a binary path or command name.");
         return;
       }
@@ -783,23 +1235,25 @@ export function AdminRagPage() {
         await createRagModuleInstance({
           name: moduleForm.name.trim(),
           module_id: moduleForm.moduleId,
-          source_type: moduleForm.sourceType,
-          model_id: moduleForm.modelId.trim() || null,
-          local_path: moduleForm.localPath.trim() || null,
-          service_url: moduleForm.serviceUrl.trim() || null,
-          binary_path: moduleForm.binaryPath.trim() || null,
+          source_type: sourceType,
+          model_id: sourceType === "local_model_path" ? moduleForm.modelId.trim() || null : null,
+          local_path: sourceType === "local_model_path" ? moduleForm.localPath.trim() || null : null,
+          service_url: sourceType === "service_url" ? moduleForm.serviceUrl.trim() || null : null,
+          binary_path: sourceType === "system_binary" ? moduleForm.binaryPath.trim() || null : null,
           enabled: true,
         });
         setModuleForm((current) => ({
           ...EMPTY_MODULE_FORM,
           moduleId: current.moduleId,
-          sourceType: current.sourceType,
+          sourceType,
+          modelId: selectedModule?.default_model_id || "",
+          localPath: defaultLocalPathForModule(selectedModule ?? undefined),
         }));
         await reloadAll();
         toastSuccess("Module instance created.");
       });
     },
-    [moduleForm, reloadAll, withBusyAction],
+    [moduleForm, reloadAll, selectedModule, withBusyAction],
   );
 
   const onTestModuleInstance = useCallback(
@@ -865,18 +1319,40 @@ export function AdminRagPage() {
   const onUploadDocument = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
-      if (!uploadFile || !uploadDatasetId) {
-        toastError("Choose a dataset and a file first.");
+      if (uploadFiles.length === 0 || !uploadDatasetId) {
+        toastError("Choose a dataset and at least one file first.");
         return;
       }
       await withBusyAction("upload-document", async () => {
-        await uploadRagDatasetDocument(uploadDatasetId, uploadFile);
-        setUploadFile(null);
+        let processedDocuments = 0;
+        const failedUploads: string[] = [];
+        for (const file of uploadFiles) {
+          try {
+            const response = await uploadRagDatasetDocument(uploadDatasetId, file);
+            processedDocuments += response.files.length || 1;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "Upload failed.";
+            failedUploads.push(`${fileDisplayName(file)}: ${message}`);
+          }
+        }
+        if (processedDocuments > 0) {
+          setUploadFiles([]);
+          setUploadInputKey((current) => current + 1);
+        }
         await reloadAll();
-        toastSuccess("Document uploaded to dataset.");
+        if (processedDocuments > 0) {
+          toastSuccess(
+            processedDocuments === 1
+              ? "Document processed into dataset."
+              : `${processedDocuments} documents processed into dataset.`,
+          );
+        }
+        if (failedUploads.length > 0) {
+          toastError(`${failedUploads.length} upload failed. ${failedUploads[0]}`);
+        }
       });
     },
-    [reloadAll, uploadDatasetId, uploadFile, withBusyAction],
+    [reloadAll, uploadDatasetId, uploadFiles, withBusyAction],
   );
 
   const onCreateCollection = useCallback(
@@ -953,8 +1429,13 @@ export function AdminRagPage() {
     [reloadAll, withBusyAction],
   );
 
+  const onInspectCollection = useCallback((collectionId: string) => {
+    setInspectorCollectionId(collectionId);
+    setInspectorOpen(true);
+  }, []);
+
   const onFileChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
-    setUploadFile(event.target.files?.[0] ?? null);
+    setUploadFiles(Array.from(event.target.files ?? []));
   }, []);
 
   if (loading && !overview) {
@@ -1188,80 +1669,57 @@ export function AdminRagPage() {
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
                 <Label htmlFor="rag-extractor">Extractor</Label>
-                <Select
+                <RAGCatalogModuleSelector
+                  catalog={moduleCatalog}
+                  installations={moduleInstallations}
                   value={ingestionForm.extractor}
                   onValueChange={(value) => setIngestionForm((current) => ({ ...current, extractor: value }))}
+                  kind="extractor"
+                  placeholder="Choose extractor"
                   disabled={!ingestionForm.extractorEnabled}
-                >
-                  <SelectTrigger id="rag-extractor">
-                    <SelectValue placeholder="Choose extractor" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {providers?.extractors.map((provider) => (
-                      <SelectItem key={provider.id} value={provider.id}>
-                        {provider.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="rag-ocr">OCR</Label>
-                <Select
+                <RAGCatalogModuleSelector
+                  catalog={moduleCatalog}
+                  installations={moduleInstallations}
                   value={ingestionForm.ocrEngine}
                   onValueChange={(value) => setIngestionForm((current) => ({ ...current, ocrEngine: value }))}
+                  kind="ocr"
+                  placeholder="Choose OCR"
                   disabled={!ingestionForm.ocrEnabled}
-                >
-                  <SelectTrigger id="rag-ocr">
-                    <SelectValue placeholder="Choose OCR" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {providers?.ocr_engines.map((provider) => (
-                      <SelectItem key={provider.id} value={provider.id}>
-                        {provider.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                />
               </div>
             </div>
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
                 <Label htmlFor="rag-embedder">Embedder</Label>
-                <Select
+                <RAGCatalogModuleSelector
+                  catalog={moduleCatalog}
+                  installations={moduleInstallations}
                   value={ingestionForm.embedder}
                   onValueChange={(value) => setIngestionForm((current) => ({ ...current, embedder: value }))}
-                >
-                  <SelectTrigger id="rag-embedder">
-                    <SelectValue placeholder="Choose embedder" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {providers?.embedders.map((provider) => (
-                      <SelectItem key={provider.id} value={provider.id}>
-                        {provider.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                  kind="embedder"
+                  placeholder="Choose embedder"
+                />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="rag-reranker">Reranker</Label>
-                <Select
-                  value={ingestionForm.reranker}
-                  onValueChange={(value) => setIngestionForm((current) => ({ ...current, reranker: value }))}
+                <RAGCatalogModuleSelector
+                  catalog={moduleCatalog}
+                  installations={moduleInstallations}
+                  value={ingestionForm.reranker === "none" ? "none-reranker" : ingestionForm.reranker}
+                  onValueChange={(value) =>
+                    setIngestionForm((current) => ({
+                      ...current,
+                      reranker: value === "none-reranker" ? "none" : value,
+                    }))
+                  }
+                  kind="reranker"
+                  placeholder="Choose reranker"
                   disabled={!ingestionForm.rerankerEnabled}
-                >
-                  <SelectTrigger id="rag-reranker">
-                    <SelectValue placeholder="Choose reranker" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {providers?.rerankers.map((provider) => (
-                      <SelectItem key={provider.id} value={provider.id}>
-                        {provider.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                />
               </div>
             </div>
             <div className="grid gap-4 sm:grid-cols-2">
@@ -1373,17 +1831,19 @@ export function AdminRagPage() {
     <div className="flex min-w-0 flex-col gap-4 md:gap-6">
       <SectionCard
         title="Module Workspace"
-        description="Search, check, install and test the concrete RAG components available on this server."
+        description="Search, check, install and test extraction, OCR, embedding, reranking and chunking components."
         icon={<HugeiconsIcon icon={Database02Icon} className="size-5" />}
-        badge={moduleCatalog.length > 0 ? `${moduleInstances.length}/${moduleCatalog.length}` : undefined}
+        badge={moduleComponentCatalog.length > 0 ? `${moduleComponentInstances.length}/${moduleComponentCatalog.length}` : undefined}
       >
         <RAGModuleCatalogBrowser
-          catalog={moduleCatalog}
+          catalog={moduleComponentCatalog}
           installations={moduleInstallations}
-          instances={moduleInstances}
+          instances={moduleComponentInstances}
           busyAction={busyAction}
           onCheckModule={(moduleId) => void onCheckModule(moduleId)}
           onInstallModule={(moduleId) => void onInstallModule(moduleId)}
+          onUninstallPackage={(moduleId) => void onUninstallModulePackage(moduleId)}
+          onDeleteInstance={(instanceId) => void onDeleteModuleInstance(instanceId)}
           onTestInstance={(instanceId) => void onTestModuleInstance(instanceId)}
         />
       </SectionCard>
@@ -1391,9 +1851,9 @@ export function AdminRagPage() {
       <div className="grid gap-4 md:gap-6 xl:grid-cols-2">
         <SectionCard
           title="Module Instances"
-          description="Bind a catalog module to a concrete local path, service endpoint or system binary."
+          description="Bind a catalog component to a concrete local path, model id or system binary."
           icon={<HugeiconsIcon icon={Book03Icon} className="size-5" />}
-          badge={moduleInstances.length > 0 ? String(moduleInstances.length) : undefined}
+          badge={moduleComponentInstances.length > 0 ? String(moduleComponentInstances.length) : undefined}
         >
           <form className="space-y-4" onSubmit={onCreateModuleInstance}>
             <div className="grid gap-4 sm:grid-cols-2">
@@ -1408,74 +1868,80 @@ export function AdminRagPage() {
               </div>
               <div className="space-y-2">
                 <Label htmlFor="rag-module-id">Module</Label>
-                <Select
+                <RAGCatalogModuleSelector
+                  catalog={moduleComponentCatalog}
+                  installations={moduleInstallations}
                   value={moduleForm.moduleId}
                   onValueChange={(value) => {
-                    const nextModule = moduleCatalogById.get(value);
+                    const nextModule = moduleComponentCatalogById.get(value);
+                    const sourceType = nextModule?.source_type ?? moduleForm.sourceType;
                     setModuleForm((current) => ({
                       ...current,
                       moduleId: value,
-                      sourceType: nextModule?.source_type ?? current.sourceType,
-                      modelId: current.modelId || nextModule?.default_model_id || "",
+                      sourceType,
+                      modelId: sourceType === "local_model_path" ? nextModule?.default_model_id || "" : "",
+                      localPath: sourceType === "local_model_path" ? defaultLocalPathForModule(nextModule) : "",
+                      serviceUrl: sourceType === "service_url" ? current.serviceUrl : "",
+                      binaryPath: sourceType === "system_binary" ? nextModule?.binary_name || "" : "",
                     }));
                   }}
-                >
-                  <SelectTrigger id="rag-module-id">
-                    <SelectValue placeholder="Choose module" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {moduleCatalog.filter((item) => item.configurable).map((item) => (
-                      <SelectItem key={item.id} value={item.id}>
-                        {item.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                  onlyConfigurable
+                  placeholder="Choose module"
+                />
               </div>
             </div>
-            <div className="space-y-2">
-              <Label htmlFor="rag-module-source">Source type</Label>
-              <Select
-                value={moduleForm.sourceType}
-                onValueChange={(value: RagModuleSourceType) =>
-                  setModuleForm((current) => ({ ...current, sourceType: value }))
-                }
-              >
-                <SelectTrigger id="rag-module-source">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {(["local_model_path", "service_url", "system_binary", "python_package"] satisfies RagModuleSourceType[]).map((value) => (
-                    <SelectItem key={value} value={value}>{value}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {selectedModule ? (
-                <div className="text-xs text-muted-foreground">
-                  Default source: {selectedModule.source_type}
-                  {selectedModule.default_model_id ? ` · model: ${selectedModule.default_model_id}` : ""}
+            {selectedModule ? (
+              <div className="rounded-md border border-border/70 bg-background/70 px-3 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-muted-foreground">Source type</span>
+                  <Badge variant="outline">{moduleSourceLabel(moduleForm.sourceType)}</Badge>
                 </div>
-              ) : null}
-            </div>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div className="space-y-2">
-                <Label htmlFor="rag-module-model">Model ID</Label>
-                <Input
-                  id="rag-module-model"
-                  value={moduleForm.modelId}
-                  onChange={(event) => setModuleForm((current) => ({ ...current, modelId: event.target.value }))}
-                  placeholder="BAAI/bge-m3"
-                />
+                <div className="mt-1 text-xs text-muted-foreground">
+                  {moduleSourceHint(moduleForm.sourceType)}
+                </div>
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="rag-module-path">Local path</Label>
-                <Input
-                  id="rag-module-path"
-                  value={moduleForm.localPath}
-                  onChange={(event) => setModuleForm((current) => ({ ...current, localPath: event.target.value }))}
-                  placeholder="/models/bge-m3"
-                />
+            ) : null}
+            {moduleForm.sourceType === "local_model_path" ? (
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="rag-module-model">Model ID</Label>
+                  <Input
+                    id="rag-module-model"
+                    value={moduleForm.modelId}
+                    onChange={(event) => setModuleForm((current) => ({ ...current, modelId: event.target.value }))}
+                    placeholder="BAAI/bge-m3"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="rag-module-path">Local path</Label>
+                  <div className="flex gap-2">
+                    <Input
+                      id="rag-module-path"
+                      value={moduleForm.localPath}
+                      onChange={(event) => setModuleForm((current) => ({ ...current, localPath: event.target.value }))}
+                      placeholder="/models/bge-m3"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      aria-label="Browse model folder"
+                      title="Browse model folder"
+                      onClick={() => setModelPathBrowserOpen(true)}
+                    >
+                      <HugeiconsIcon icon={Search01Icon} className="size-4" />
+                    </Button>
+                  </div>
+                  <FolderBrowser
+                    open={modelPathBrowserOpen}
+                    onOpenChange={setModelPathBrowserOpen}
+                    initialPath={moduleForm.localPath.trim() || undefined}
+                    onSelect={(path) => setModuleForm((current) => ({ ...current, localPath: path }))}
+                  />
+                </div>
               </div>
+            ) : null}
+            {moduleForm.sourceType === "service_url" ? (
               <div className="space-y-2">
                 <Label htmlFor="rag-module-service">Service URL</Label>
                 <Input
@@ -1485,6 +1951,8 @@ export function AdminRagPage() {
                   placeholder="http://127.0.0.1:6333"
                 />
               </div>
+            ) : null}
+            {moduleForm.sourceType === "system_binary" ? (
               <div className="space-y-2">
                 <Label htmlFor="rag-module-binary">Binary path</Label>
                 <Input
@@ -1494,7 +1962,7 @@ export function AdminRagPage() {
                   placeholder="tesseract"
                 />
               </div>
-            </div>
+            ) : null}
             <Button type="submit" disabled={busyAction === "create-module-instance"}>
               {busyAction === "create-module-instance" ? <Spinner className="size-4" /> : "Create Module Instance"}
             </Button>
@@ -1509,40 +1977,77 @@ export function AdminRagPage() {
           <form className="space-y-4" onSubmit={onInstallLocalModule}>
             <div className="space-y-2">
               <Label htmlFor="rag-local-install-module">Module</Label>
-              <Select
+              <RAGCatalogModuleSelector
+                catalog={moduleCatalog}
+                installations={moduleInstallations}
                 value={localInstallForm.moduleId}
                 onValueChange={(value) => setLocalInstallForm((current) => ({ ...current, moduleId: value }))}
+                onlyPackageBacked
+                placeholder="Choose installable module"
+              />
+              {selectedLocalInstallModule?.package_name ? (
+                <div className="text-xs text-muted-foreground">
+                  Package: {selectedLocalInstallModule.package_name}
+                </div>
+              ) : null}
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="rag-local-install-source">Install source</Label>
+              <Select
+                value={localInstallForm.sourceMode}
+                onValueChange={(value: LocalInstallFormState["sourceMode"]) =>
+                  setLocalInstallForm((current) => ({ ...current, sourceMode: value }))
+                }
               >
-                <SelectTrigger id="rag-local-install-module">
-                  <SelectValue placeholder="Choose installable module" />
+                <SelectTrigger id="rag-local-install-source">
+                  <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {moduleCatalog.filter((item) => item.package_name).map((item) => (
-                    <SelectItem key={item.id} value={item.id}>
-                      {item.label}
-                    </SelectItem>
-                  ))}
+                  <SelectItem value="wheelhouse">Wheelhouse folder</SelectItem>
+                  <SelectItem value="package">Wheel file path</SelectItem>
                 </SelectContent>
               </Select>
             </div>
-            <div className="space-y-2">
-              <Label htmlFor="rag-local-package-path">Wheel file path</Label>
-              <Input
-                id="rag-local-package-path"
-                value={localInstallForm.packagePath}
-                onChange={(event) => setLocalInstallForm((current) => ({ ...current, packagePath: event.target.value }))}
-                placeholder="/opt/packages/docling-*.whl"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="rag-local-wheelhouse-path">Wheelhouse path</Label>
-              <Input
-                id="rag-local-wheelhouse-path"
-                value={localInstallForm.wheelhousePath}
-                onChange={(event) => setLocalInstallForm((current) => ({ ...current, wheelhousePath: event.target.value }))}
-                placeholder="/opt/wheelhouse"
-              />
-            </div>
+            {localInstallForm.sourceMode === "package" ? (
+              <div className="space-y-2">
+                <Label htmlFor="rag-local-package-path">Wheel file path</Label>
+                <Input
+                  id="rag-local-package-path"
+                  value={localInstallForm.packagePath}
+                  onChange={(event) => setLocalInstallForm((current) => ({ ...current, packagePath: event.target.value }))}
+                  placeholder="/opt/packages/docling-1.0.0-py3-none-any.whl"
+                />
+              </div>
+            ) : null}
+            {localInstallForm.sourceMode === "wheelhouse" ? (
+              <div className="space-y-2">
+                <Label htmlFor="rag-local-wheelhouse-path">Wheelhouse folder</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="rag-local-wheelhouse-path"
+                    value={localInstallForm.wheelhousePath}
+                    onChange={(event) => setLocalInstallForm((current) => ({ ...current, wheelhousePath: event.target.value }))}
+                    placeholder="/opt/wheelhouse"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    aria-label="Browse wheelhouse folder"
+                    title="Browse wheelhouse folder"
+                    onClick={() => setOfflineWheelhouseBrowserOpen(true)}
+                  >
+                    <HugeiconsIcon icon={Search01Icon} className="size-4" />
+                  </Button>
+                </div>
+                <FolderBrowser
+                  open={offlineWheelhouseBrowserOpen}
+                  onOpenChange={setOfflineWheelhouseBrowserOpen}
+                  initialPath={localInstallForm.wheelhousePath.trim() || undefined}
+                  onSelect={(path) => setLocalInstallForm((current) => ({ ...current, wheelhousePath: path }))}
+                />
+              </div>
+            ) : null}
             <Button type="submit" disabled={busyAction === "module-install-local"}>
               {busyAction === "module-install-local" ? <Spinner className="size-4" /> : "Install From Local Path"}
             </Button>
@@ -1676,11 +2181,45 @@ export function AdminRagPage() {
                   </Select>
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="rag-upload-file">File</Label>
-                  <Input id="rag-upload-file" type="file" onChange={onFileChange} />
+                  <Label htmlFor="rag-upload-file">Files or archive</Label>
+                  <Input
+                    key={`files-${uploadInputKey}`}
+                    id="rag-upload-file"
+                    type="file"
+                    multiple
+                    accept={RAG_UPLOAD_ACCEPT}
+                    onChange={onFileChange}
+                  />
                 </div>
-                <Button type="submit" disabled={busyAction === "upload-document" || !uploadDatasetId}>
-                  {busyAction === "upload-document" ? <Spinner className="size-4" /> : "Upload Document"}
+                <div className="space-y-2">
+                  <Label htmlFor="rag-upload-folder">Folder</Label>
+                  <Input
+                    key={`folder-${uploadInputKey}`}
+                    id="rag-upload-folder"
+                    type="file"
+                    multiple
+                    accept={RAG_UPLOAD_ACCEPT}
+                    onChange={onFileChange}
+                    {...DIRECTORY_INPUT_PROPS}
+                  />
+                  {uploadFiles.length > 0 ? (
+                    <div className="rounded-2xl border border-border/70 bg-background/80 p-3">
+                      <div className="text-xs font-medium text-muted-foreground">
+                        {uploadFiles.length} file{uploadFiles.length === 1 ? "" : "s"} queued for processing
+                      </div>
+                      <div className="mt-2 space-y-1">
+                        {uploadFiles.map((file) => (
+                          <div key={`${fileDisplayName(file)}:${file.size}:${file.lastModified}`} className="flex min-w-0 items-center justify-between gap-3 text-xs">
+                            <span className="truncate">{fileDisplayName(file)}</span>
+                            <span className="shrink-0 text-muted-foreground">{fileSizeLabel(file.size)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+                <Button type="submit" disabled={busyAction === "upload-document" || !uploadDatasetId || uploadFiles.length === 0}>
+                  {busyAction === "upload-document" ? <Spinner className="size-4" /> : "Process Files"}
                 </Button>
               </form>
             </TabsContent>
@@ -1706,6 +2245,11 @@ export function AdminRagPage() {
                 {metricLabel(dataset.documents_count)} documents · {metricLabel(dataset.chunks_count)} chunks · {metricLabel(dataset.total_characters)} chars
               </div>
               {dataset.description ? <div className="mt-2 text-xs text-muted-foreground">{dataset.description}</div> : null}
+              {dataset.last_error ? (
+                <div className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1 text-xs text-destructive">
+                  {dataset.last_error}
+                </div>
+              ) : null}
             </div>
           )) : (
             <Empty>
@@ -1912,6 +2456,13 @@ export function AdminRagPage() {
                     <Button
                       variant="outline"
                       size="sm"
+                      onClick={() => onInspectCollection(item.id)}
+                    >
+                      Inspect
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
                       disabled={busyAction === reindexKey}
                       onClick={() => void onReindex(item.id)}
                     >
@@ -2046,7 +2597,7 @@ export function AdminRagPage() {
     <div className="relative min-h-screen bg-background">
       <main className="relative z-10 mx-auto max-w-7xl px-4 py-4 sm:px-6">
         <div className="mb-6 flex flex-col gap-0.5 sm:mb-8">
-          <h1 className="text-2xl font-semibold tracking-tight">RAG Admin</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">RAG</h1>
           <p className="text-sm text-muted-foreground">{subtitle}</p>
         </div>
 
@@ -2137,6 +2688,11 @@ export function AdminRagPage() {
           </TabsContent>
         </Tabs>
       </main>
+      <CollectionInspectorSheet
+        collectionId={inspectorCollectionId}
+        open={inspectorOpen}
+        onOpenChange={setInspectorOpen}
+      />
     </div>
   );
 }
